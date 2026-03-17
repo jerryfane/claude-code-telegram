@@ -146,6 +146,63 @@ class ClaudeSDKManager:
         else:
             logger.info("No API key provided, using existing Claude CLI authentication")
 
+    def _resolve_memory_file(
+        self,
+        memory_dir: Path,
+        user_id: Optional[int],
+        filename: str,
+    ) -> Optional[str]:
+        """Resolve a single memory file with user -> default fallback."""
+        if user_id is not None:
+            user_path = memory_dir / "users" / str(user_id) / filename
+            if user_path.is_file():
+                try:
+                    return user_path.read_text(encoding="utf-8")
+                except OSError:
+                    logger.warning(
+                        "Failed to read user memory file",
+                        path=str(user_path),
+                        user_id=user_id,
+                    )
+
+        default_path = memory_dir / "default" / filename
+        if default_path.is_file():
+            try:
+                return default_path.read_text(encoding="utf-8")
+            except OSError:
+                logger.warning(
+                    "Failed to read default memory file",
+                    path=str(default_path),
+                )
+
+        return None
+
+    def _build_memory_prompt(self, user_id: Optional[int]) -> str:
+        """Load per-user memory files and return them as a system prompt section.
+
+        Resolution order for each file:
+        1. .memory/users/{user_id}/{file} -- per-user override
+        2. .memory/default/{file} -- project-level default
+        3. (skip) -- no injection for that file
+        """
+        memory_dir = self.config.resolved_memory_dir
+        if not memory_dir:
+            return ""
+
+        memory_files = ["SOUL.md", "USER.md", "MEMORY.md"]
+
+        sections: List[str] = []
+        for filename in memory_files:
+            content = self._resolve_memory_file(memory_dir, user_id, filename)
+            if content:
+                label = filename.replace(".md", "").upper()
+                sections.append(f"## {label}\n\n{content}")
+
+        if not sections:
+            return ""
+
+        return "# Assistant Memory\n\n" + "\n\n---\n\n".join(sections)
+
     async def execute_command(
         self,
         prompt: str,
@@ -153,6 +210,7 @@ class ClaudeSDKManager:
         session_id: Optional[str] = None,
         continue_session: bool = False,
         stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
+        user_id: Optional[int] = None,
     ) -> ClaudeResponse:
         """Execute Claude Code command via SDK."""
         start_time = asyncio.get_event_loop().time()
@@ -185,6 +243,16 @@ class ClaudeSDKManager:
                     path=str(claude_md_path),
                 )
 
+            # Load per-user memory files (SOUL, USER, MEMORY)
+            memory_prompt = self._build_memory_prompt(user_id)
+            if memory_prompt:
+                base_prompt += "\n\n" + memory_prompt
+                logger.info(
+                    "Loaded memory files into system prompt",
+                    user_id=user_id,
+                    memory_length=len(memory_prompt),
+                )
+
             # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
             # tools so the SDK does not restrict tool usage (e.g. MCP tools).
             if self.config.disable_tool_validation:
@@ -210,7 +278,7 @@ class ClaudeSDKManager:
                     "excludedCommands": self.config.sandbox_excluded_commands or [],
                 },
                 system_prompt=base_prompt,
-                setting_sources=["project"],
+                setting_sources=["user", "project"],
                 stderr=_stderr_callback,
             )
 

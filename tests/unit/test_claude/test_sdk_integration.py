@@ -1084,8 +1084,8 @@ class TestClaudeMdLoading:
         assert "Use relative paths." in opts.system_prompt
         assert "# Project Rules" not in opts.system_prompt
 
-    async def test_setting_sources_includes_project(self, sdk_manager, tmp_path):
-        """setting_sources=['project'] is passed to ClaudeAgentOptions."""
+    async def test_setting_sources_includes_user_and_project(self, sdk_manager, tmp_path):
+        """setting_sources=['user', 'project'] is passed to ClaudeAgentOptions."""
         captured: list = []
         mock_factory = _mock_client_factory(
             _make_assistant_message("ok"),
@@ -1099,4 +1099,4 @@ class TestClaudeMdLoading:
             await sdk_manager.execute_command(prompt="test", working_directory=tmp_path)
 
         opts = captured[0]
-        assert opts.setting_sources == ["project"]
+        assert opts.setting_sources == ["user", "project"]

@@ -147,3 +147,9 @@ sessions/
 backups/
 uploads/
 config/mcp.json
+
+# Temporary image uploads from Claude processing
+.claude_upload_*
+
+# Personal assistant memory (private, not shared)
+.memory/

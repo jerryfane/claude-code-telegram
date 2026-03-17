@@ -248,6 +248,15 @@ class Settings(BaseSettings):
     webhook_port: int = Field(8443, description="Webhook port")
     webhook_path: str = Field("/webhook", description="Webhook path")
 
+    # Per-user memory
+    memory_dir: Optional[Path] = Field(
+        None,
+        description=(
+            "Path to .memory/ directory for per-user personality and memory files. "
+            "Defaults to .memory/ in the approved directory if it exists."
+        ),
+    )
+
     # Agentic platform settings
     enable_api_server: bool = Field(False, description="Enable FastAPI webhook server")
     api_server_port: int = Field(8080, description="Webhook API server port")
@@ -523,3 +532,16 @@ class Settings(BaseSettings):
         if self.voice_provider == "openai":
             return "OpenAI Whisper"
         return "Mistral Voxtral"
+
+    @property
+    def resolved_memory_dir(self) -> Optional[Path]:
+        """Resolve the memory directory for per-user personality/memory files.
+
+        Falls back to .memory/ in the approved directory if it exists.
+        """
+        if self.memory_dir and self.memory_dir.is_dir():
+            return self.memory_dir
+        default_path = self.approved_directory / ".memory"
+        if default_path.is_dir():
+            return default_path
+        return None

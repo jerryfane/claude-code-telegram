@@ -1117,6 +1117,7 @@ class MessageOrchestrator:
         features = context.bot_data.get("features")
         file_handler = features.get_file_handler() if features else None
         prompt: Optional[str] = None
+        image_path: Optional[str] = None
 
         if file_handler:
             try:
@@ -1132,20 +1133,43 @@ class MessageOrchestrator:
         if not file_handler:
             file = await document.get_file()
             file_bytes = await file.download_as_bytearray()
-            try:
-                content = file_bytes.decode("utf-8")
-                if len(content) > 50000:
-                    content = content[:50000] + "\n... (truncated)"
-                caption = update.message.caption or "Please review this file:"
+
+            # Check if this is an image file
+            if self._is_image_file(document.file_name, bytes(file_bytes)):
+                current_dir = context.user_data.get(
+                    "current_directory", self.settings.approved_directory
+                )
+                ext = Path(document.file_name).suffix.lstrip(".").lower()
+                if ext in ("jpg", "jpeg"):
+                    img_format = "jpeg"
+                else:
+                    img_format = ext or "png"
+                image_path = self._save_image_to_working_dir(
+                    bytes(file_bytes), current_dir, img_format
+                )
+                caption = update.message.caption or ""
+                caption_part = f"\n\nUser's message: {caption}" if caption else ""
                 prompt = (
-                    f"{caption}\n\n**File:** `{document.file_name}`\n\n"
-                    f"```\n{content}\n```"
+                    f"I've shared an image file (`{document.file_name}`) with you. "
+                    f"It has been saved to `{image_path}`. "
+                    f"Use your Read tool to view and analyze it."
+                    f"{caption_part}"
                 )
-            except UnicodeDecodeError:
-                await progress_msg.edit_text(
-                    "Unsupported file format. Must be text-based (UTF-8)."
-                )
-                return
+            else:
+                try:
+                    content = file_bytes.decode("utf-8")
+                    if len(content) > 50000:
+                        content = content[:50000] + "\n... (truncated)"
+                    caption = update.message.caption or "Please review this file:"
+                    prompt = (
+                        f"{caption}\n\n**File:** `{document.file_name}`\n\n"
+                        f"```\n{content}\n```"
+                    )
+                except UnicodeDecodeError:
+                    await progress_msg.edit_text(
+                        "Unsupported file format. Must be text-based (UTF-8)."
+                    )
+                    return
 
         # Process with Claude
         claude_integration = context.bot_data.get("claude_integration")
@@ -1258,6 +1282,8 @@ class MessageOrchestrator:
             logger.error("Claude file processing failed", error=str(e), user_id=user_id)
         finally:
             heartbeat.cancel()
+            if image_path:
+                Path(image_path).unlink(missing_ok=True)
 
     async def agentic_photo(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1276,15 +1302,41 @@ class MessageOrchestrator:
         await chat.send_action("typing")
         progress_msg = await update.message.reply_text("Working...")
 
+        image_path: Optional[str] = None
         try:
             photo = update.message.photo[-1]
             processed_image = await image_handler.process_image(
                 photo, update.message.caption
             )
+
+            # Save image to disk so Claude can read it with its Read tool
+            import base64
+
+            image_bytes = base64.b64decode(processed_image.base64_data)
+            current_dir = context.user_data.get(
+                "current_directory", self.settings.approved_directory
+            )
+            img_format = (
+                processed_image.metadata.get("format", "png")
+                if processed_image.metadata
+                else "png"
+            )
+            image_path = self._save_image_to_working_dir(
+                image_bytes, current_dir, img_format
+            )
+
+            caption = update.message.caption or ""
+            caption_part = f"\n\nUser's message: {caption}" if caption else ""
+            prompt = (
+                f"I've shared an image with you. It has been saved to "
+                f"`{image_path}`. Use your Read tool to view and analyze it."
+                f"{caption_part}"
+            )
+
             await self._handle_agentic_media_message(
                 update=update,
                 context=context,
-                prompt=processed_image.prompt,
+                prompt=prompt,
                 progress_msg=progress_msg,
                 user_id=user_id,
                 chat=chat,
@@ -1297,6 +1349,9 @@ class MessageOrchestrator:
             logger.error(
                 "Claude photo processing failed", error=str(e), user_id=user_id
             )
+        finally:
+            if image_path:
+                Path(image_path).unlink(missing_ok=True)
 
     async def agentic_voice(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1449,6 +1504,50 @@ class MessageOrchestrator:
                     )
                 except Exception as img_err:
                     logger.warning("Image send failed", error=str(img_err))
+
+    _IMAGE_EXTENSIONS = {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".bmp",
+        ".tiff",
+        ".svg",
+    }
+
+    def _is_image_file(self, filename: Optional[str], data: bytes) -> bool:
+        """Check if a file is an image by extension or magic bytes."""
+        if filename:
+            ext = Path(filename).suffix.lower()
+            if ext in self._IMAGE_EXTENSIONS:
+                return True
+        # Fallback: check magic bytes
+        if data[:4] == b"\x89PNG":
+            return True
+        if data[:3] == b"\xff\xd8\xff":
+            return True
+        if data[:6] in (b"GIF87a", b"GIF89a"):
+            return True
+        if data[:4] == b"RIFF" and b"WEBP" in data[:12]:
+            return True
+        return False
+
+    def _save_image_to_working_dir(
+        self, image_bytes: bytes, working_dir: str, img_format: str
+    ) -> str:
+        """Save image bytes to a temp file in the working directory. Returns the path."""
+        import uuid
+
+        safe_format = (
+            img_format
+            if img_format in ("png", "jpeg", "jpg", "gif", "webp", "bmp")
+            else "png"
+        )
+        filename = f".claude_upload_{uuid.uuid4().hex[:8]}.{safe_format}"
+        filepath = Path(working_dir) / filename
+        filepath.write_bytes(image_bytes)
+        return str(filepath)
 
     def _voice_unavailable_message(self) -> str:
         """Return provider-aware guidance when voice feature is unavailable."""

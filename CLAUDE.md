@@ -135,3 +135,51 @@ Agentic mode commands: `/start`, `/new`, `/status`, `/verbose`, `/repo`. If `ENA
 2. Register in `MessageOrchestrator._register_classic_handlers()`
 3. Add to `MessageOrchestrator.get_bot_commands()` for Telegram's command menu
 4. Add audit logging for the command
+
+## Per-User Memory System
+
+The bot supports **per-user personality and memory files** via `.memory/`. Three files (SOUL.md, USER.md, MEMORY.md) are automatically injected into Claude's system prompt when processing messages. This is gitignored and separate from project docs.
+
+### File Structure
+
+```
+.memory/
+├── default/             # Fallback files for users without custom profiles
+│   ├── SOUL.md          # Default assistant personality
+│   ├── USER.md          # Template user profile
+│   └── MEMORY.md        # Template essential facts
+└── users/
+    └── {telegram_id}/   # Per-user overrides (any subset of files)
+        ├── SOUL.md      # Custom personality
+        ├── USER.md      # User profile & preferences
+        ├── MEMORY.md    # Essential facts (~100 lines)
+        ├── BOOT.md      # Session startup checklist (reference only)
+        ├── IDENTITY.md  # Quick reference card (reference only)
+        └── memory/      # Deep storage
+            ├── people/
+            ├── projects/
+            ├── topics/
+            └── decisions/
+```
+
+### Resolution Order
+
+For each memory file (SOUL.md, USER.md, MEMORY.md):
+1. `.memory/users/{telegram_user_id}/{file}` — per-user version
+2. `.memory/default/{file}` — project-level default
+3. (skip) — file not injected
+
+### Configuration
+
+Set `MEMORY_DIR` environment variable to override the default `.memory/` location (defaults to `.memory/` inside `APPROVED_DIRECTORY`).
+
+### Rules for Claude
+
+1. **Boot sequence**: At session start, read the user's `BOOT.md`, then `SOUL.md`, `USER.md`, and `MEMORY.md`.
+2. **Update proactively**: When learning new facts, preferences, or making decisions — update the relevant memory file before session ends.
+3. **Tier-1 files stay small**: `MEMORY.md` stays ~100 lines. Move details to `memory/` subdirectories.
+4. **Date everything**: All entries in decisions, tasks, and session logs get `YYYY-MM-DD`.
+5. **Don't duplicate CLAUDE.md**: Memory files are for *personal* context, not project architecture.
+6. **Mark completed tasks**: `[x]` with completion date and brief outcome.
+7. **Session log**: Add a brief entry to `MEMORY.md` session log at the end of significant sessions.
+8. **Never overwrite rules.md**: Files named `rules.md` in `memory/` are Jerry's manual overrides.
