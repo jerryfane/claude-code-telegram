@@ -27,6 +27,7 @@ from src.notifications.service import NotificationService
 from src.projects import ProjectThreadManager, load_project_registry
 from src.scheduler.heartbeat import HeartbeatService
 from src.scheduler.scheduler import JobScheduler
+from src.scheduler.x_digest import XDigestService
 from src.security.audit import AuditLogger, InMemoryAuditStorage
 from src.security.auth import (
     AuthenticationManager,
@@ -168,6 +169,11 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         memory_dir=config.resolved_memory_dir,
     )
 
+    # X/Twitter digest service
+    x_digest_service = XDigestService(
+        working_directory=config.approved_directory,
+    )
+
     # Agent handler — translates events into Claude executions
     agent_handler = AgentHandler(
         event_bus=event_bus,
@@ -175,6 +181,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         default_working_directory=config.approved_directory,
         default_user_id=config.allowed_users[0] if config.allowed_users else 0,
         heartbeat_service=heartbeat_service,
+        x_digest_service=x_digest_service,
         suppress_quiet_heartbeats=True,
     )
     agent_handler.register()
@@ -211,6 +218,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "auth_manager": auth_manager,
         "security_validator": security_validator,
         "heartbeat_service": heartbeat_service,
+        "x_digest_service": x_digest_service,
     }
 
 
@@ -325,10 +333,12 @@ async def run_application(app: Dict[str, Any]) -> None:
             )
             await scheduler.start()
 
-            # Expose scheduler and heartbeat in bot deps for /cron command
+            # Expose scheduler, heartbeat, and x_digest in bot deps for /cron command
             heartbeat_service: HeartbeatService = app["heartbeat_service"]
+            x_digest_service: XDigestService = app["x_digest_service"]
             bot.deps["scheduler"] = scheduler
             bot.deps["heartbeat_service"] = heartbeat_service
+            bot.deps["x_digest_service"] = x_digest_service
 
             # Seed a default heartbeat job on first start
             try:

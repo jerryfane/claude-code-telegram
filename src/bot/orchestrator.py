@@ -1686,11 +1686,13 @@ class MessageOrchestrator:
 
         /cron                           — list all active jobs
         /cron heartbeat <cron>          — add a heartbeat job
+        /cron x_digest <cron>           — add an X/Twitter digest job
         /cron add <cron> | <name> | <prompt> — add a generic job
         /cron remove <job_id>           — remove a job
         /cron update <job_id> <cron>    — update a job's schedule
         /cron reload                    — reload all jobs from database
         /cron test heartbeat            — run Phase 1 checks now (no Claude)
+        /cron test x_digest             — dry-run X search (no Claude)
         """
         from ..scheduler.scheduler import JobScheduler
 
@@ -1711,13 +1713,14 @@ class MessageOrchestrator:
 
         subcmd = raw_args[0].lower()
 
-        if (
-            subcmd == "test"
-            and len(raw_args) >= 2
-            and raw_args[1].lower() == "heartbeat"
-        ):
-            await self._cron_test_heartbeat(update, context)
-            return
+        if subcmd == "test" and len(raw_args) >= 2:
+            test_target = raw_args[1].lower()
+            if test_target == "heartbeat":
+                await self._cron_test_heartbeat(update, context)
+                return
+            if test_target == "x_digest":
+                await self._cron_test_x_digest(update, context)
+                return
 
         if subcmd == "heartbeat":
             cron_expr = " ".join(raw_args[1:])
@@ -1739,6 +1742,34 @@ class MessageOrchestrator:
                 )
                 await update.message.reply_text(
                     f"Heartbeat job added.\n"
+                    f"ID: <code>{escape_html(job_id)}</code>\n"
+                    f"Schedule: <code>{escape_html(cron_expr)}</code>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                await update.message.reply_text(f"Failed to add job: {e}")
+            return
+
+        if subcmd == "x_digest":
+            cron_expr = " ".join(raw_args[1:])
+            if not cron_expr:
+                await update.message.reply_text(
+                    "Usage: <code>/cron x_digest 0 9 * * *</code>",
+                    parse_mode="HTML",
+                )
+                return
+            try:
+                config = self.settings
+                job_id = await scheduler.add_job(
+                    job_name="X Digest",
+                    cron_expression=cron_expr,
+                    prompt="",
+                    target_chat_ids=config.notification_chat_ids or [],
+                    skill_name="x_digest",
+                    created_by=update.effective_user.id,
+                )
+                await update.message.reply_text(
+                    f"X/Twitter digest job added.\n"
                     f"ID: <code>{escape_html(job_id)}</code>\n"
                     f"Schedule: <code>{escape_html(cron_expr)}</code>",
                     parse_mode="HTML",
@@ -1823,11 +1854,13 @@ class MessageOrchestrator:
             "<b>Usage:</b>\n"
             "<code>/cron</code> — list jobs\n"
             "<code>/cron heartbeat &lt;cron&gt;</code> — add heartbeat\n"
+            "<code>/cron x_digest &lt;cron&gt;</code> — add X/Twitter digest\n"
             "<code>/cron add &lt;cron&gt; | &lt;name&gt; | &lt;prompt&gt;</code> — add job\n"
             "<code>/cron remove &lt;job_id&gt;</code> — remove job\n"
             "<code>/cron update &lt;job_id&gt; &lt;new_cron&gt;</code> — update schedule\n"
             "<code>/cron reload</code> — reload jobs from database\n"
-            "<code>/cron test heartbeat</code> — dry-run Phase 1 checks",
+            "<code>/cron test heartbeat</code> — dry-run Phase 1 checks\n"
+            "<code>/cron test x_digest</code> — dry-run X search",
             parse_mode="HTML",
         )
 
@@ -1891,6 +1924,60 @@ class MessageOrchestrator:
                 lines.append(f"  <code>{escape_html(detail)}</code>")
 
         lines.append("\nA real heartbeat would invoke Claude with these signals.")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def _cron_test_x_digest(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Run X/Twitter digest search and show raw results (no Claude)."""
+        from ..scheduler.x_digest import XDigestService
+
+        x_digest: Optional[XDigestService] = context.bot_data.get(
+            "x_digest_service"
+        )
+        if not x_digest:
+            await update.message.reply_text("XDigestService is not available.")
+            return
+
+        await update.message.reply_text("Running X digest search...")
+        await update.message.chat.send_action("typing")
+        result = await x_digest.run()
+
+        if result.error and not result.has_results:
+            await update.message.reply_text(
+                f"X digest failed: {escape_html(result.error)}",
+                parse_mode="HTML",
+            )
+            return
+
+        if not result.has_results:
+            await update.message.reply_text("No tweets found for any topic.")
+            return
+
+        lines = [
+            f"<b>X Digest — {result.total_tweets} tweet(s) "
+            f"across {len(result.topics)} topic(s)</b>\n"
+        ]
+        for topic in result.topics:
+            lines.append(f"\n<b>{escape_html(topic.topic)}</b>")
+            if topic.error:
+                lines.append(f"  Error: {escape_html(topic.error)}")
+                continue
+            for tweet in topic.tweets[:5]:  # Show first 5 per topic
+                user = tweet.get("user", {})
+                handle = user.get("screen_name", "?")
+                text = tweet.get("text", "")[:120]
+                likes = tweet.get("favorite_count", 0)
+                lines.append(
+                    f"  • @{escape_html(handle)}: "
+                    f"{escape_html(text)}\n"
+                    f"    [{likes} likes]"
+                )
+            remaining = len(topic.tweets) - 5
+            if remaining > 0:
+                lines.append(f"  ... and {remaining} more")
+
+        lines.append("\nA real digest would send these to Claude for summarization.")
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def _agentic_callback(

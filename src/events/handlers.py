@@ -11,6 +11,7 @@ import structlog
 
 from ..claude.facade import ClaudeIntegration
 from ..scheduler.heartbeat import HeartbeatService
+from ..scheduler.x_digest import XDigestService
 from .bus import Event, EventBus
 from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
 
@@ -35,6 +36,7 @@ class AgentHandler:
         default_working_directory: Path,
         default_user_id: int = 0,
         heartbeat_service: Optional[HeartbeatService] = None,
+        x_digest_service: Optional[XDigestService] = None,
         suppress_quiet_heartbeats: bool = True,
     ) -> None:
         self.event_bus = event_bus
@@ -42,6 +44,7 @@ class AgentHandler:
         self.default_working_directory = default_working_directory
         self.default_user_id = default_user_id
         self.heartbeat = heartbeat_service
+        self.x_digest = x_digest_service
         self.suppress_quiet_heartbeats = suppress_quiet_heartbeats
 
     def register(self) -> None:
@@ -103,6 +106,11 @@ class AgentHandler:
         # Heartbeat jobs: run cheap checks first, only invoke Claude if needed
         if event.skill_name == "heartbeat" and self.heartbeat:
             await self._handle_heartbeat(event)
+            return
+
+        # X/Twitter digest: search then summarize with Claude
+        if event.skill_name == "x_digest" and self.x_digest:
+            await self._handle_x_digest(event)
             return
 
         prompt = event.prompt
@@ -188,6 +196,66 @@ class AgentHandler:
         except Exception:
             logger.exception(
                 "Heartbeat check failed",
+                job_id=event.job_id,
+                event_id=event.id,
+            )
+
+    async def _handle_x_digest(self, event: ScheduledEvent) -> None:
+        """Run X/Twitter digest: search tweets, then summarize with Claude."""
+        assert self.x_digest is not None
+
+        try:
+            result = await self.x_digest.run()
+
+            if result.error and not result.has_results:
+                logger.error("X digest failed", error=result.error)
+                await self._broadcast_response(
+                    event.target_chat_ids,
+                    f"X digest failed: {result.error}",
+                    event.id,
+                )
+                return
+
+            if not result.has_results:
+                logger.info("X digest returned no tweets")
+                await self._broadcast_response(
+                    event.target_chat_ids,
+                    "X digest: no tweets found for any topic.",
+                    event.id,
+                )
+                return
+
+            # Summarize with Claude
+            prompt = result.build_prompt()
+            logger.info(
+                "X digest found tweets, invoking Claude",
+                total_tweets=result.total_tweets,
+                topic_count=len(result.topics),
+            )
+
+            working_dir = event.working_directory or self.default_working_directory
+            user_id = event.user_id or self.default_user_id
+            response = await self.claude.run_command(
+                prompt=prompt,
+                working_directory=working_dir,
+                user_id=user_id,
+            )
+
+            if response.content:
+                header = (
+                    f"📰 <b>X/Twitter Daily Digest — "
+                    f"{result.total_tweets} tweets across "
+                    f"{len(result.topics)} topic(s)</b>\n\n"
+                )
+                await self._broadcast_response(
+                    event.target_chat_ids,
+                    header + response.content,
+                    event.id,
+                )
+
+        except Exception:
+            logger.exception(
+                "X digest handler failed",
                 job_id=event.job_id,
                 event_id=event.id,
             )

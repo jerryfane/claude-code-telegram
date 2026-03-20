@@ -1,0 +1,8 @@
+{
+  "topics": [
+    {"name": "AI Agents", "query": "AI agents lang:en -is:retweet", "count": 15},
+    {"name": "Claude AI", "query": "Claude Anthropic lang:en -is:retweet", "count": 10},
+    {"name": "Jerry's Timeline", "type": "user", "screen_name": "0xJerry543", "count": 10}
+  ],
+  "default_count": 20
+}
