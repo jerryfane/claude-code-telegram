@@ -82,6 +82,7 @@ class JobScheduler:
                 "working_directory": str(work_dir),
                 "target_chat_ids": target_chat_ids or [],
                 "skill_name": skill_name,
+                "created_by": created_by,
             },
             name=job_name,
         )
@@ -171,6 +172,7 @@ class JobScheduler:
         working_directory: str,
         target_chat_ids: List[int],
         skill_name: Optional[str],
+        created_by: int = 0,
     ) -> None:
         """Called by APScheduler when a job triggers. Publishes a ScheduledEvent."""
         event = ScheduledEvent(
@@ -179,6 +181,7 @@ class JobScheduler:
             working_directory=Path(working_directory),
             target_chat_ids=target_chat_ids,
             skill_name=skill_name,
+            user_id=created_by,
         )
 
         logger.info(
@@ -220,6 +223,7 @@ class JobScheduler:
                             "working_directory": row_dict["working_directory"],
                             "target_chat_ids": chat_ids,
                             "skill_name": row_dict.get("skill_name"),
+                            "created_by": row_dict.get("created_by", 0),
                         },
                         id=row_dict["job_id"],
                         name=row_dict["job_name"],

@@ -114,10 +114,11 @@ class AgentHandler:
         working_dir = event.working_directory or self.default_working_directory
 
         try:
+            user_id = event.user_id or self.default_user_id
             response = await self.claude.run_command(
                 prompt=prompt,
                 working_directory=working_dir,
-                user_id=self.default_user_id,
+                user_id=user_id,
             )
 
             if response.content:
@@ -169,10 +170,11 @@ class AgentHandler:
             )
 
             working_dir = event.working_directory or self.default_working_directory
+            user_id = event.user_id or self.default_user_id
             response = await self.claude.run_command(
                 prompt=prompt,
                 working_directory=working_dir,
-                user_id=self.default_user_id,
+                user_id=user_id,
             )
 
             if response.content:
