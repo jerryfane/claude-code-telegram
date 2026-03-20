@@ -149,6 +149,15 @@ class AgentHandler:
                     )
                 return
 
+            # Dedup: suppress Claude if signals haven't changed since last check
+            if self.heartbeat.is_duplicate_signal(result):
+                await self.heartbeat.record_signal(result)
+                logger.info(
+                    "Heartbeat signals unchanged, skipping Claude",
+                    signal_count=len(result.signals),
+                )
+                return
+
             # Phase 2: signals found — invoke Claude with focused prompt
             await self.heartbeat.record_signal(result)
             prompt = result.build_prompt()
@@ -167,9 +176,7 @@ class AgentHandler:
             )
 
             if response.content:
-                header = (
-                    f"🫀 <b>Heartbeat — {len(result.signals)} signal(s)</b>\n\n"
-                )
+                header = f"🫀 <b>Heartbeat — {len(result.signals)} signal(s)</b>\n\n"
                 await self._broadcast_response(
                     event.target_chat_ids,
                     header + response.content,

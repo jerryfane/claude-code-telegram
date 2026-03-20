@@ -5,6 +5,7 @@ Phase 2: Only invoke Claude if Phase 1 found signals worth reporting.
 """
 
 import asyncio
+import hashlib
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -47,7 +48,18 @@ class HeartbeatResult:
         if not self.signals:
             return "ok"
         severity_order = {"info": 0, "warning": 1, "critical": 2}
-        return max(self.signals, key=lambda s: severity_order.get(s.severity, 0)).severity
+        return max(
+            self.signals, key=lambda s: severity_order.get(s.severity, 0)
+        ).severity
+
+    def signal_fingerprint(self) -> str:
+        """SHA256 fingerprint of current signals for deduplication."""
+        parts: List[str] = []
+        for sig in sorted(self.signals, key=lambda s: (s.category, s.summary)):
+            details_str = "|".join(sorted(sig.details))
+            parts.append(f"{sig.category}|{sig.severity}|{sig.summary}|{details_str}")
+        raw = "\n".join(parts)
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
     def build_prompt(self) -> str:
         """Build a focused Claude prompt from detected signals."""
@@ -89,6 +101,7 @@ class HeartbeatService:
         self.disk_threshold_pct = disk_threshold_pct
         self._heartbeat_file = self.memory_dir / "HEARTBEAT.md"
         self._last_heartbeat: Optional[datetime] = self._read_last_heartbeat()
+        self._last_fingerprint: Optional[str] = self._read_last_fingerprint()
 
     async def run_checks(self) -> HeartbeatResult:
         """Run all Phase 1 deterministic checks."""
@@ -128,20 +141,25 @@ class HeartbeatService:
             f"# Heartbeat\n\n"
             f"Last check: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
             f"Status: ✅ All quiet — no Claude invocation needed\n"
+            f"Signal fingerprint: none\n"
         )
+        self._last_fingerprint = None
         logger.info("Heartbeat quiet — no LLM call", timestamp=now.isoformat())
 
     async def record_signal(self, result: HeartbeatResult) -> None:
         """Signal detected: update HEARTBEAT.md with findings."""
         now = datetime.now(UTC)
         self._last_heartbeat = now
+        fingerprint = result.signal_fingerprint()
+        self._last_fingerprint = fingerprint
 
         self._heartbeat_file.parent.mkdir(parents=True, exist_ok=True)
 
         lines = [
             "# Heartbeat\n",
             f"Last check: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}",
-            f"Status: ⚠️ {len(result.signals)} signal(s) detected — Claude invoked\n",
+            f"Status: ⚠️ {len(result.signals)} signal(s) detected — Claude invoked",
+            f"Signal fingerprint: {fingerprint}\n",
         ]
         for sig in result.signals:
             lines.append(f"- **{sig.category}**: {sig.summary}")
@@ -169,7 +187,9 @@ class HeartbeatService:
                     user_dir = memory_file.parent.name
                     tasks_found.append(f"[{user_dir}] {task.strip()}")
             except Exception as e:
-                logger.debug("Failed to read memory file", path=str(memory_file), error=str(e))
+                logger.debug(
+                    "Failed to read memory file", path=str(memory_file), error=str(e)
+                )
 
         if tasks_found:
             # Check staleness
@@ -196,7 +216,9 @@ class HeartbeatService:
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                "git", "status", "--porcelain",
+                "git",
+                "status",
+                "--porcelain",
                 cwd=str(self.working_directory),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -231,7 +253,10 @@ class HeartbeatService:
             if self._last_heartbeat:
                 since = self._last_heartbeat.strftime("%Y-%m-%dT%H:%M:%S")
                 proc = await asyncio.create_subprocess_exec(
-                    "git", "log", f"--since={since}", "--oneline",
+                    "git",
+                    "log",
+                    f"--since={since}",
+                    "--oneline",
                     cwd=str(self.working_directory),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
@@ -261,7 +286,8 @@ class HeartbeatService:
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                "pm2", "jlist",
+                "pm2",
+                "jlist",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -283,7 +309,10 @@ class HeartbeatService:
                             category="process",
                             severity="critical",
                             summary=f"Process '{name}' is {status}",
-                            details=[f"Restarts: {restarts}", f"Memory: {memory_mb:.0f}MB"],
+                            details=[
+                                f"Restarts: {restarts}",
+                                f"Memory: {memory_mb:.0f}MB",
+                            ],
                         )
                     )
                 elif restarts > 5:
@@ -381,6 +410,28 @@ class HeartbeatService:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _read_last_fingerprint(self) -> Optional[str]:
+        """Read last signal fingerprint from HEARTBEAT.md."""
+        if not self._heartbeat_file.exists():
+            return None
+
+        try:
+            content = self._heartbeat_file.read_text()
+            match = re.search(r"Signal fingerprint:\s*(\S+)", content)
+            if match:
+                value = match.group(1)
+                return None if value == "none" else value
+        except Exception as e:
+            logger.debug("Failed to parse fingerprint from HEARTBEAT.md", error=str(e))
+
+        return None
+
+    def is_duplicate_signal(self, result: HeartbeatResult) -> bool:
+        """Check if the current signals match the last recorded fingerprint."""
+        if self._last_fingerprint is None:
+            return False
+        return result.signal_fingerprint() == self._last_fingerprint
 
     def _read_last_heartbeat(self) -> Optional[datetime]:
         """Read last heartbeat timestamp from HEARTBEAT.md."""

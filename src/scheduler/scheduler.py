@@ -4,6 +4,7 @@ Wraps APScheduler's AsyncIOScheduler and publishes ScheduledEvents
 to the event bus when jobs fire.
 """
 
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -114,6 +115,44 @@ class JobScheduler:
 
         await self._delete_job(job_id)
         logger.info("Scheduled job removed", job_id=job_id)
+        return True
+
+    async def reload_jobs(self) -> int:
+        """Remove all in-memory jobs and reload from database.
+
+        Returns the number of jobs loaded.
+        """
+        self._scheduler.remove_all_jobs()
+        await self._load_jobs_from_db()
+        jobs = self._scheduler.get_jobs()
+        logger.info("Scheduler reloaded from database", job_count=len(jobs))
+        return len(jobs)
+
+    async def update_job(self, job_id: str, cron_expression: str) -> bool:
+        """Update a job's cron schedule in both APScheduler and the database."""
+        try:
+            trigger = CronTrigger.from_crontab(cron_expression)
+            self._scheduler.reschedule_job(job_id, trigger=trigger)
+        except Exception:
+            logger.warning("Failed to reschedule job in APScheduler", job_id=job_id)
+            return False
+
+        async with self.db_manager.get_connection() as conn:
+            await conn.execute(
+                """
+                UPDATE scheduled_jobs
+                SET cron_expression = ?, updated_at = ?
+                WHERE job_id = ? AND is_active = 1
+                """,
+                (cron_expression, datetime.now(UTC).isoformat(), job_id),
+            )
+            await conn.commit()
+
+        logger.info(
+            "Scheduled job updated",
+            job_id=job_id,
+            cron=cron_expression,
+        )
         return True
 
     async def list_jobs(self) -> List[Dict[str, Any]]:

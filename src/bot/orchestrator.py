@@ -1665,6 +1665,8 @@ class MessageOrchestrator:
         /cron heartbeat <cron>          — add a heartbeat job
         /cron add <cron> | <name> | <prompt> — add a generic job
         /cron remove <job_id>           — remove a job
+        /cron update <job_id> <cron>    — update a job's schedule
+        /cron reload                    — reload all jobs from database
         /cron test heartbeat            — run Phase 1 checks now (no Claude)
         """
         from ..scheduler.scheduler import JobScheduler
@@ -1763,12 +1765,45 @@ class MessageOrchestrator:
             )
             return
 
+        if subcmd == "update" and len(raw_args) >= 3:
+            job_id = raw_args[1]
+            new_cron = " ".join(raw_args[2:])
+            try:
+                success = await scheduler.update_job(job_id, new_cron)
+                if success:
+                    await update.message.reply_text(
+                        f"Job <code>{escape_html(job_id)}</code> updated.\n"
+                        f"New schedule: <code>{escape_html(new_cron)}</code>",
+                        parse_mode="HTML",
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"Failed to update job <code>{escape_html(job_id)}</code>. "
+                        f"Job may not exist.",
+                        parse_mode="HTML",
+                    )
+            except Exception as e:
+                await update.message.reply_text(f"Failed to update job: {e}")
+            return
+
+        if subcmd == "reload":
+            try:
+                count = await scheduler.reload_jobs()
+                await update.message.reply_text(
+                    f"Scheduler reloaded. {count} active job(s) loaded.",
+                )
+            except Exception as e:
+                await update.message.reply_text(f"Failed to reload: {e}")
+            return
+
         await update.message.reply_text(
             "<b>Usage:</b>\n"
             "<code>/cron</code> — list jobs\n"
             "<code>/cron heartbeat &lt;cron&gt;</code> — add heartbeat\n"
             "<code>/cron add &lt;cron&gt; | &lt;name&gt; | &lt;prompt&gt;</code> — add job\n"
             "<code>/cron remove &lt;job_id&gt;</code> — remove job\n"
+            "<code>/cron update &lt;job_id&gt; &lt;new_cron&gt;</code> — update schedule\n"
+            "<code>/cron reload</code> — reload jobs from database\n"
             "<code>/cron test heartbeat</code> — dry-run Phase 1 checks",
             parse_mode="HTML",
         )
