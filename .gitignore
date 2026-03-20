@@ -153,3 +153,6 @@ config/mcp.json
 
 # Personal assistant memory (private, not shared)
 .memory/
+
+/repos/
+ecosystem.config.js

@@ -25,6 +25,7 @@ from src.events.middleware import EventSecurityMiddleware
 from src.exceptions import ConfigurationError
 from src.notifications.service import NotificationService
 from src.projects import ProjectThreadManager, load_project_registry
+from src.scheduler.heartbeat import HeartbeatService
 from src.scheduler.scheduler import JobScheduler
 from src.security.audit import AuditLogger, InMemoryAuditStorage
 from src.security.auth import (
@@ -161,12 +162,20 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     )
     event_security.register()
 
+    # Heartbeat service — cheap Phase 1 checks before invoking Claude
+    heartbeat_service = HeartbeatService(
+        working_directory=config.approved_directory,
+        memory_dir=config.resolved_memory_dir,
+    )
+
     # Agent handler — translates events into Claude executions
     agent_handler = AgentHandler(
         event_bus=event_bus,
         claude_integration=claude_integration,
         default_working_directory=config.approved_directory,
         default_user_id=config.allowed_users[0] if config.allowed_users else 0,
+        heartbeat_service=heartbeat_service,
+        suppress_quiet_heartbeats=True,
     )
     agent_handler.register()
 
@@ -201,6 +210,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "agent_handler": agent_handler,
         "auth_manager": auth_manager,
         "security_validator": security_validator,
+        "heartbeat_service": heartbeat_service,
     }
 
 
@@ -314,6 +324,31 @@ async def run_application(app: Dict[str, Any]) -> None:
                 default_working_directory=config.approved_directory,
             )
             await scheduler.start()
+
+            # Expose scheduler and heartbeat in bot deps for /cron command
+            heartbeat_service: HeartbeatService = app["heartbeat_service"]
+            bot.deps["scheduler"] = scheduler
+            bot.deps["heartbeat_service"] = heartbeat_service
+
+            # Seed a default heartbeat job on first start
+            try:
+                jobs = await scheduler.list_jobs()
+                has_heartbeat = any(j.get("skill_name") == "heartbeat" for j in jobs)
+                if not has_heartbeat:
+                    await scheduler.add_job(
+                        job_name="Heartbeat",
+                        cron_expression="0 */6 * * *",
+                        prompt="",
+                        target_chat_ids=config.notification_chat_ids or [],
+                        skill_name="heartbeat",
+                        created_by=(
+                            config.allowed_users[0] if config.allowed_users else 0
+                        ),
+                    )
+                    logger.info("Default heartbeat job created (every 6 hours)")
+            except Exception as e:
+                logger.warning("Failed to seed heartbeat job", error=str(e))
+
             logger.info("Job scheduler enabled")
 
         # Shutdown task

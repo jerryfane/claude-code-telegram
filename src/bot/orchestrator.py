@@ -308,6 +308,7 @@ class MessageOrchestrator:
             ("verbose", self.agentic_verbose),
             ("repo", self.agentic_repo),
             ("restart", command.restart_command),
+            ("cron", self.agentic_cron),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -417,6 +418,7 @@ class MessageOrchestrator:
                 BotCommand("verbose", "Set output verbosity (0/1/2)"),
                 BotCommand("repo", "List repos / switch workspace"),
                 BotCommand("restart", "Restart the bot"),
+                BotCommand("cron", "Manage scheduled jobs"),
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
@@ -1653,6 +1655,185 @@ class MessageOrchestrator:
             parse_mode="HTML",
             reply_markup=reply_markup,
         )
+
+    async def agentic_cron(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Manage scheduled jobs.
+
+        /cron                           — list all active jobs
+        /cron heartbeat <cron>          — add a heartbeat job
+        /cron add <cron> | <name> | <prompt> — add a generic job
+        /cron remove <job_id>           — remove a job
+        /cron test heartbeat            — run Phase 1 checks now (no Claude)
+        """
+        from ..scheduler.scheduler import JobScheduler
+
+        scheduler: Optional[JobScheduler] = context.bot_data.get("scheduler")
+        if not scheduler:
+            await update.message.reply_text(
+                "Scheduler is not enabled. Set <code>ENABLE_SCHEDULER=true</code>.",
+                parse_mode="HTML",
+            )
+            return
+
+        raw_args = update.message.text.split()[1:] if update.message.text else []
+
+        # /cron (no args) — list jobs
+        if not raw_args:
+            await self._cron_list(update, scheduler)
+            return
+
+        subcmd = raw_args[0].lower()
+
+        if (
+            subcmd == "test"
+            and len(raw_args) >= 2
+            and raw_args[1].lower() == "heartbeat"
+        ):
+            await self._cron_test_heartbeat(update, context)
+            return
+
+        if subcmd == "heartbeat":
+            cron_expr = " ".join(raw_args[1:])
+            if not cron_expr:
+                await update.message.reply_text(
+                    "Usage: <code>/cron heartbeat 0 */6 * * *</code>",
+                    parse_mode="HTML",
+                )
+                return
+            try:
+                config = self.settings
+                job_id = await scheduler.add_job(
+                    job_name="Heartbeat",
+                    cron_expression=cron_expr,
+                    prompt="",
+                    target_chat_ids=config.notification_chat_ids or [],
+                    skill_name="heartbeat",
+                    created_by=update.effective_user.id,
+                )
+                await update.message.reply_text(
+                    f"Heartbeat job added.\n"
+                    f"ID: <code>{escape_html(job_id)}</code>\n"
+                    f"Schedule: <code>{escape_html(cron_expr)}</code>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                await update.message.reply_text(f"Failed to add job: {e}")
+            return
+
+        if subcmd == "add":
+            # /cron add <cron> | <name> | <prompt>
+            rest = " ".join(raw_args[1:])
+            parts = [p.strip() for p in rest.split("|")]
+            if len(parts) < 3:
+                await update.message.reply_text(
+                    "Usage: <code>/cron add 0 9 * * 1-5 | Daily standup | "
+                    "Summarize yesterday's commits</code>",
+                    parse_mode="HTML",
+                )
+                return
+            cron_expr, name, prompt = parts[0], parts[1], " ".join(parts[2:])
+            try:
+                config = self.settings
+                job_id = await scheduler.add_job(
+                    job_name=name,
+                    cron_expression=cron_expr,
+                    prompt=prompt,
+                    target_chat_ids=config.notification_chat_ids or [],
+                    created_by=update.effective_user.id,
+                )
+                await update.message.reply_text(
+                    f"Job added.\n"
+                    f"ID: <code>{escape_html(job_id)}</code>\n"
+                    f"Name: {escape_html(name)}\n"
+                    f"Schedule: <code>{escape_html(cron_expr)}</code>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                await update.message.reply_text(f"Failed to add job: {e}")
+            return
+
+        if subcmd == "remove" and len(raw_args) >= 2:
+            job_id = raw_args[1]
+            await scheduler.remove_job(job_id)
+            await update.message.reply_text(
+                f"Job <code>{escape_html(job_id)}</code> removed.",
+                parse_mode="HTML",
+            )
+            return
+
+        await update.message.reply_text(
+            "<b>Usage:</b>\n"
+            "<code>/cron</code> — list jobs\n"
+            "<code>/cron heartbeat &lt;cron&gt;</code> — add heartbeat\n"
+            "<code>/cron add &lt;cron&gt; | &lt;name&gt; | &lt;prompt&gt;</code> — add job\n"
+            "<code>/cron remove &lt;job_id&gt;</code> — remove job\n"
+            "<code>/cron test heartbeat</code> — dry-run Phase 1 checks",
+            parse_mode="HTML",
+        )
+
+    async def _cron_list(self, update: Update, scheduler: Any) -> None:
+        """List all active scheduled jobs."""
+        jobs = await scheduler.list_jobs()
+        if not jobs:
+            await update.message.reply_text("No scheduled jobs.")
+            return
+
+        lines = ["<b>Scheduled Jobs</b>\n"]
+        for j in jobs:
+            name = j.get("job_name", "?")
+            cron = j.get("cron_expression", "?")
+            job_id = j.get("job_id", "?")
+            skill = j.get("skill_name", "")
+            skill_badge = f" [{skill}]" if skill else ""
+            lines.append(
+                f"• <b>{escape_html(name)}</b>{skill_badge}\n"
+                f"  Schedule: <code>{escape_html(cron)}</code>\n"
+                f"  ID: <code>{escape_html(str(job_id))}</code>"
+            )
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def _cron_test_heartbeat(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Run Phase 1 heartbeat checks and show results (no Claude call)."""
+        from ..scheduler.heartbeat import HeartbeatService
+
+        heartbeat: Optional[HeartbeatService] = context.bot_data.get(
+            "heartbeat_service"
+        )
+        if not heartbeat:
+            await update.message.reply_text("HeartbeatService is not available.")
+            return
+
+        await update.message.chat.send_action("typing")
+        result = await heartbeat.run_checks()
+
+        if not result.has_signals:
+            await update.message.reply_text(
+                "Phase 1 complete — all quiet. No signals detected.\n"
+                "A real heartbeat would skip Claude and cost $0."
+            )
+            return
+
+        lines = [
+            f"<b>Phase 1 — {len(result.signals)} signal(s)</b>\n"
+            f"Max severity: {result.max_severity}\n"
+        ]
+        severity_icons = {"info": "ℹ️", "warning": "⚠️", "critical": "🚨"}
+        for sig in result.signals:
+            icon = severity_icons.get(sig.severity, "•")
+            lines.append(
+                f"{icon} <b>{escape_html(sig.category)}</b> — "
+                f"{escape_html(sig.summary)}"
+            )
+            for detail in sig.details[:5]:
+                lines.append(f"  <code>{escape_html(detail)}</code>")
+
+        lines.append("\nA real heartbeat would invoke Claude with these signals.")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

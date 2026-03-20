@@ -100,13 +100,14 @@ def test_agentic_registers_6_commands(agentic_settings, deps):
     ]
     commands = [h[0][0].commands for h in cmd_handlers]
 
-    assert len(cmd_handlers) == 6
+    assert len(cmd_handlers) == 7
     assert frozenset({"start"}) in commands
     assert frozenset({"new"}) in commands
     assert frozenset({"status"}) in commands
     assert frozenset({"verbose"}) in commands
     assert frozenset({"repo"}) in commands
     assert frozenset({"restart"}) in commands
+    assert frozenset({"cron"}) in commands
 
 
 def test_classic_registers_14_commands(classic_settings, deps):
@@ -160,9 +161,9 @@ async def test_agentic_bot_commands(agentic_settings, deps):
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     commands = await orchestrator.get_bot_commands()
 
-    assert len(commands) == 6
+    assert len(commands) == 7
     cmd_names = [c.command for c in commands]
-    assert cmd_names == ["start", "new", "status", "verbose", "repo", "restart"]
+    assert cmd_names == ["start", "new", "status", "verbose", "repo", "restart", "cron"]
 
 
 async def test_classic_bot_commands(classic_settings, deps):

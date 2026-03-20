@@ -5,11 +5,12 @@ NotificationHandler: subscribes to AgentResponseEvent and delivers to Telegram.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import structlog
 
 from ..claude.facade import ClaudeIntegration
+from ..scheduler.heartbeat import HeartbeatService
 from .bus import Event, EventBus
 from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
 
@@ -22,6 +23,9 @@ class AgentHandler:
     Webhook and scheduled events are converted into prompts and sent
     to ClaudeIntegration.run_command(). The response is published
     back as an AgentResponseEvent for delivery.
+
+    Heartbeat jobs (skill_name="heartbeat") run cheap Phase 1 checks
+    first and only invoke Claude if signals are detected.
     """
 
     def __init__(
@@ -30,11 +34,15 @@ class AgentHandler:
         claude_integration: ClaudeIntegration,
         default_working_directory: Path,
         default_user_id: int = 0,
+        heartbeat_service: Optional[HeartbeatService] = None,
+        suppress_quiet_heartbeats: bool = True,
     ) -> None:
         self.event_bus = event_bus
         self.claude = claude_integration
         self.default_working_directory = default_working_directory
         self.default_user_id = default_user_id
+        self.heartbeat = heartbeat_service
+        self.suppress_quiet_heartbeats = suppress_quiet_heartbeats
 
     def register(self) -> None:
         """Subscribe to events that need agent processing."""
@@ -82,7 +90,7 @@ class AgentHandler:
             )
 
     async def handle_scheduled(self, event: Event) -> None:
-        """Process a scheduled event through Claude."""
+        """Process a scheduled event — heartbeat jobs get Phase 1 gating."""
         if not isinstance(event, ScheduledEvent):
             return
 
@@ -91,6 +99,11 @@ class AgentHandler:
             job_id=event.job_id,
             job_name=event.job_name,
         )
+
+        # Heartbeat jobs: run cheap checks first, only invoke Claude if needed
+        if event.skill_name == "heartbeat" and self.heartbeat:
+            await self._handle_heartbeat(event)
+            return
 
         prompt = event.prompt
         if event.skill_name:
@@ -108,29 +121,91 @@ class AgentHandler:
             )
 
             if response.content:
-                for chat_id in event.target_chat_ids:
-                    await self.event_bus.publish(
-                        AgentResponseEvent(
-                            chat_id=chat_id,
-                            text=response.content,
-                            originating_event_id=event.id,
-                        )
-                    )
-
-                # Also broadcast to default chats if no targets specified
-                if not event.target_chat_ids:
-                    await self.event_bus.publish(
-                        AgentResponseEvent(
-                            chat_id=0,
-                            text=response.content,
-                            originating_event_id=event.id,
-                        )
-                    )
+                await self._broadcast_response(
+                    event.target_chat_ids, response.content, event.id
+                )
         except Exception:
             logger.exception(
                 "Agent execution failed for scheduled event",
                 job_id=event.job_id,
                 event_id=event.id,
+            )
+
+    async def _handle_heartbeat(self, event: ScheduledEvent) -> None:
+        """Two-phase heartbeat: cheap checks first, Claude only if signals found."""
+        assert self.heartbeat is not None
+
+        try:
+            result = await self.heartbeat.run_checks()
+
+            if not result.has_signals:
+                # Phase 1 all-clear: write timestamp, skip Claude, $0
+                await self.heartbeat.record_quiet()
+                if not self.suppress_quiet_heartbeats:
+                    await self._broadcast_response(
+                        event.target_chat_ids,
+                        "🫀 Heartbeat: all quiet. No action needed.",
+                        event.id,
+                    )
+                return
+
+            # Phase 2: signals found — invoke Claude with focused prompt
+            await self.heartbeat.record_signal(result)
+            prompt = result.build_prompt()
+
+            logger.info(
+                "Heartbeat found signals, invoking Claude",
+                signal_count=len(result.signals),
+                max_severity=result.max_severity,
+            )
+
+            working_dir = event.working_directory or self.default_working_directory
+            response = await self.claude.run_command(
+                prompt=prompt,
+                working_directory=working_dir,
+                user_id=self.default_user_id,
+            )
+
+            if response.content:
+                header = (
+                    f"🫀 <b>Heartbeat — {len(result.signals)} signal(s)</b>\n\n"
+                )
+                await self._broadcast_response(
+                    event.target_chat_ids,
+                    header + response.content,
+                    event.id,
+                )
+
+        except Exception:
+            logger.exception(
+                "Heartbeat check failed",
+                job_id=event.job_id,
+                event_id=event.id,
+            )
+
+    async def _broadcast_response(
+        self,
+        target_chat_ids: List[int],
+        text: str,
+        originating_event_id: Optional[str],
+    ) -> None:
+        """Publish response to target chats or broadcast to defaults."""
+        if target_chat_ids:
+            for chat_id in target_chat_ids:
+                await self.event_bus.publish(
+                    AgentResponseEvent(
+                        chat_id=chat_id,
+                        text=text,
+                        originating_event_id=originating_event_id,
+                    )
+                )
+        else:
+            await self.event_bus.publish(
+                AgentResponseEvent(
+                    chat_id=0,
+                    text=text,
+                    originating_event_id=originating_event_id,
+                )
             )
 
     def _build_webhook_prompt(self, event: WebhookEvent) -> str:
