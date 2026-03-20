@@ -25,6 +25,7 @@ from ..utils.image_extractor import (
     should_send_as_photo,
     validate_image_path,
 )
+from ..utils.reply_context import extract_reply_context
 
 logger = structlog.get_logger()
 
@@ -300,6 +301,11 @@ async def handle_text_message(
     user_id = update.effective_user.id
     message_text = update.message.text
     settings: Settings = context.bot_data["settings"]
+
+    # Prepend quoted message context when replying to a previous message
+    reply_context = extract_reply_context(update.message)
+    if reply_context:
+        message_text = f"{reply_context}\n\n{message_text}"
 
     # Get services
     rate_limiter: Optional[RateLimiter] = context.bot_data.get("rate_limiter")
@@ -817,6 +823,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         session_id = context.user_data.get("claude_session_id")
 
+        # Prepend quoted message context when replying to a previous message
+        doc_reply_context = extract_reply_context(update.message)
+        if doc_reply_context:
+            prompt = f"{doc_reply_context}\n\n{prompt}"
+
         # Process with Claude
         try:
             claude_response = await claude_integration.run_command(
@@ -944,10 +955,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             )
             session_id = context.user_data.get("claude_session_id")
 
+            # Prepend quoted message context when replying to a previous message
+            photo_prompt = processed_image.prompt
+            photo_reply_context = extract_reply_context(update.message)
+            if photo_reply_context:
+                photo_prompt = f"{photo_reply_context}\n\n{photo_prompt}"
+
             # Process with Claude
             try:
                 claude_response = await claude_integration.run_command(
-                    prompt=processed_image.prompt,
+                    prompt=photo_prompt,
                     working_directory=current_dir,
                     user_id=user_id,
                     session_id=session_id,
@@ -1060,11 +1077,17 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         session_id = context.user_data.get("claude_session_id")
 
+        # Prepend quoted message context when replying to a previous message
+        voice_prompt = processed_voice.prompt
+        voice_reply_context = extract_reply_context(update.message)
+        if voice_reply_context:
+            voice_prompt = f"{voice_reply_context}\n\n{voice_prompt}"
+
         try:
             # Keep classic mode aligned with handle_photo: single progress message,
             # no streaming callback or typing heartbeat.
             claude_response = await claude_integration.run_command(
-                prompt=processed_voice.prompt,
+                prompt=voice_prompt,
                 working_directory=current_dir,
                 user_id=user_id,
                 session_id=session_id,

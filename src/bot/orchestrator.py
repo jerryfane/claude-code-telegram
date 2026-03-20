@@ -38,6 +38,7 @@ from .utils.image_extractor import (
     should_send_as_photo,
     validate_image_path,
 )
+from .utils.reply_context import extract_reply_context
 
 logger = structlog.get_logger()
 
@@ -869,6 +870,11 @@ class MessageOrchestrator:
         user_id = update.effective_user.id
         message_text = update.message.text
 
+        # Prepend quoted message context when replying to a previous message
+        reply_context = extract_reply_context(update.message)
+        if reply_context:
+            message_text = f"{reply_context}\n\n{message_text}"
+
         logger.info(
             "Agentic text message",
             user_id=user_id,
@@ -1173,6 +1179,11 @@ class MessageOrchestrator:
                     )
                     return
 
+        # Prepend quoted message context when replying to a previous message
+        reply_context = extract_reply_context(update.message)
+        if reply_context and prompt:
+            prompt = f"{reply_context}\n\n{prompt}"
+
         # Process with Claude
         claude_integration = context.bot_data.get("claude_integration")
         if not claude_integration:
@@ -1335,6 +1346,11 @@ class MessageOrchestrator:
                 f"{caption_part}"
             )
 
+            # Prepend quoted message context when replying to a previous message
+            reply_context = extract_reply_context(update.message)
+            if reply_context:
+                prompt = f"{reply_context}\n\n{prompt}"
+
             await self._handle_agentic_media_message(
                 update=update,
                 context=context,
@@ -1379,10 +1395,17 @@ class MessageOrchestrator:
             )
 
             await progress_msg.edit_text("Working...")
+
+            # Prepend quoted message context when replying to a previous message
+            voice_prompt = processed_voice.prompt
+            reply_context = extract_reply_context(update.message)
+            if reply_context:
+                voice_prompt = f"{reply_context}\n\n{voice_prompt}"
+
             await self._handle_agentic_media_message(
                 update=update,
                 context=context,
-                prompt=processed_voice.prompt,
+                prompt=voice_prompt,
                 progress_msg=progress_msg,
                 user_id=user_id,
                 chat=chat,
