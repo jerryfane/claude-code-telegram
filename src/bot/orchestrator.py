@@ -951,6 +951,11 @@ class MessageOrchestrator:
                 force_new=force_new,
             )
 
+            # Fire-and-forget memory sync (non-blocking)
+            memory_sync = context.bot_data.get("memory_sync_service")
+            if memory_sync:
+                asyncio.create_task(memory_sync.sync_if_needed())
+
             # New session created successfully — clear the one-shot flag
             if force_new:
                 context.user_data["force_new_session"] = False
@@ -1224,6 +1229,11 @@ class MessageOrchestrator:
                 force_new=force_new,
             )
 
+            # Fire-and-forget memory sync (non-blocking)
+            memory_sync = context.bot_data.get("memory_sync_service")
+            if memory_sync:
+                asyncio.create_task(memory_sync.sync_if_needed())
+
             if force_new:
                 context.user_data["force_new_session"] = False
 
@@ -1467,6 +1477,11 @@ class MessageOrchestrator:
             )
         finally:
             heartbeat.cancel()
+
+        # Fire-and-forget memory sync (non-blocking)
+        memory_sync = context.bot_data.get("memory_sync_service")
+        if memory_sync:
+            asyncio.create_task(memory_sync.sync_if_needed())
 
         if force_new:
             context.user_data["force_new_session"] = False

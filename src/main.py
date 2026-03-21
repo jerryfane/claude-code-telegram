@@ -26,6 +26,7 @@ from src.exceptions import ConfigurationError
 from src.notifications.service import NotificationService
 from src.projects import ProjectThreadManager, load_project_registry
 from src.scheduler.heartbeat import HeartbeatService
+from src.scheduler.memory_sync import MemorySyncService
 from src.scheduler.scheduler import JobScheduler
 from src.scheduler.x_digest import XDigestService
 from src.security.audit import AuditLogger, InMemoryAuditStorage
@@ -174,6 +175,14 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         working_directory=config.approved_directory,
     )
 
+    # Memory sync service — event-driven push after Claude writes
+    memory_sync_service: Optional[MemorySyncService] = None
+    if config.resolved_memory_dir:
+        memory_sync_service = MemorySyncService(
+            memory_dir=config.resolved_memory_dir,
+        )
+        logger.info("Memory sync service enabled", memory_dir=str(config.resolved_memory_dir))
+
     # Agent handler — translates events into Claude executions
     agent_handler = AgentHandler(
         event_bus=event_bus,
@@ -182,6 +191,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         default_user_id=config.allowed_users[0] if config.allowed_users else 0,
         heartbeat_service=heartbeat_service,
         x_digest_service=x_digest_service,
+        memory_sync_service=memory_sync_service,
         suppress_quiet_heartbeats=True,
     )
     agent_handler.register()
@@ -201,6 +211,10 @@ async def create_application(config: Settings) -> Dict[str, Any]:
 
     bot = ClaudeCodeBot(config, dependencies)
 
+    # Memory sync available to all handlers (not just scheduler)
+    if memory_sync_service:
+        bot.deps["memory_sync_service"] = memory_sync_service
+
     # Notification service and scheduler need the bot's Telegram Bot instance,
     # which is only available after bot.initialize(). We store placeholders
     # and wire them up in run_application() after initialization.
@@ -219,6 +233,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "security_validator": security_validator,
         "heartbeat_service": heartbeat_service,
         "x_digest_service": x_digest_service,
+        "memory_sync_service": memory_sync_service,
     }
 
 

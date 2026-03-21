@@ -4,6 +4,7 @@ AgentHandler: translates events into ClaudeIntegration.run_command() calls.
 NotificationHandler: subscribes to AgentResponseEvent and delivers to Telegram.
 """
 
+import asyncio
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -11,6 +12,7 @@ import structlog
 
 from ..claude.facade import ClaudeIntegration
 from ..scheduler.heartbeat import HeartbeatService
+from ..scheduler.memory_sync import MemorySyncService
 from ..scheduler.x_digest import XDigestService
 from .bus import Event, EventBus
 from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
@@ -37,6 +39,7 @@ class AgentHandler:
         default_user_id: int = 0,
         heartbeat_service: Optional[HeartbeatService] = None,
         x_digest_service: Optional[XDigestService] = None,
+        memory_sync_service: Optional[MemorySyncService] = None,
         suppress_quiet_heartbeats: bool = True,
     ) -> None:
         self.event_bus = event_bus
@@ -45,6 +48,7 @@ class AgentHandler:
         self.default_user_id = default_user_id
         self.heartbeat = heartbeat_service
         self.x_digest = x_digest_service
+        self.memory_sync = memory_sync_service
         self.suppress_quiet_heartbeats = suppress_quiet_heartbeats
 
     def register(self) -> None:
@@ -72,6 +76,7 @@ class AgentHandler:
                 working_directory=self.default_working_directory,
                 user_id=self.default_user_id,
             )
+            self._fire_memory_sync()
 
             if response.content:
                 # We don't know which chat to send to from a webhook alone.
@@ -128,6 +133,7 @@ class AgentHandler:
                 working_directory=working_dir,
                 user_id=user_id,
             )
+            self._fire_memory_sync()
 
             if response.content:
                 await self._broadcast_response(
@@ -184,6 +190,7 @@ class AgentHandler:
                 working_directory=working_dir,
                 user_id=user_id,
             )
+            self._fire_memory_sync()
 
             if response.content:
                 header = f"🫀 <b>Heartbeat — {len(result.signals)} signal(s)</b>\n\n"
@@ -240,6 +247,7 @@ class AgentHandler:
                 working_directory=working_dir,
                 user_id=user_id,
             )
+            self._fire_memory_sync()
 
             if response.content:
                 header = (
@@ -259,6 +267,11 @@ class AgentHandler:
                 job_id=event.job_id,
                 event_id=event.id,
             )
+
+    def _fire_memory_sync(self) -> None:
+        """Fire-and-forget memory sync after Claude may have written files."""
+        if self.memory_sync:
+            asyncio.create_task(self.memory_sync.sync_if_needed())
 
     async def _broadcast_response(
         self,
