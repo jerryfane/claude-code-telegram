@@ -310,6 +310,7 @@ class MessageOrchestrator:
             ("repo", self.agentic_repo),
             ("restart", command.restart_command),
             ("cron", self.agentic_cron),
+            ("moltbook", self.agentic_moltbook),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -1708,6 +1709,8 @@ class MessageOrchestrator:
         /cron reload                    — reload all jobs from database
         /cron test heartbeat            — run Phase 1 checks now (no Claude)
         /cron test x_digest             — dry-run X search (no Claude)
+        /cron moltbook_stats <cron>     — add a Moltbook stats polling job
+        /cron test moltbook_stats       — poll Moltbook stats now
         """
         from ..scheduler.scheduler import JobScheduler
 
@@ -1735,6 +1738,9 @@ class MessageOrchestrator:
                 return
             if test_target == "x_digest":
                 await self._cron_test_x_digest(update, context)
+                return
+            if test_target == "moltbook_stats":
+                await self._cron_test_moltbook_stats(update, context)
                 return
 
         if subcmd == "heartbeat":
@@ -1785,6 +1791,34 @@ class MessageOrchestrator:
                 )
                 await update.message.reply_text(
                     f"X/Twitter digest job added.\n"
+                    f"ID: <code>{escape_html(job_id)}</code>\n"
+                    f"Schedule: <code>{escape_html(cron_expr)}</code>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                await update.message.reply_text(f"Failed to add job: {e}")
+            return
+
+        if subcmd == "moltbook_stats":
+            cron_expr = " ".join(raw_args[1:])
+            if not cron_expr:
+                await update.message.reply_text(
+                    "Usage: <code>/cron moltbook_stats 0 */2 * * *</code>",
+                    parse_mode="HTML",
+                )
+                return
+            try:
+                config = self.settings
+                job_id = await scheduler.add_job(
+                    job_name="Moltbook Stats",
+                    cron_expression=cron_expr,
+                    prompt="",
+                    target_chat_ids=config.notification_chat_ids or [],
+                    skill_name="moltbook_stats",
+                    created_by=update.effective_user.id,
+                )
+                await update.message.reply_text(
+                    f"Moltbook stats job added.\n"
                     f"ID: <code>{escape_html(job_id)}</code>\n"
                     f"Schedule: <code>{escape_html(cron_expr)}</code>",
                     parse_mode="HTML",
@@ -1875,7 +1909,9 @@ class MessageOrchestrator:
             "<code>/cron update &lt;job_id&gt; &lt;new_cron&gt;</code> — update schedule\n"
             "<code>/cron reload</code> — reload jobs from database\n"
             "<code>/cron test heartbeat</code> — dry-run Phase 1 checks\n"
-            "<code>/cron test x_digest</code> — dry-run X search",
+            "<code>/cron test x_digest</code> — dry-run X search\n"
+            "<code>/cron moltbook_stats &lt;cron&gt;</code> — add Moltbook stats job\n"
+            "<code>/cron test moltbook_stats</code> — poll Moltbook stats now",
             parse_mode="HTML",
         )
 
@@ -1994,6 +2030,82 @@ class MessageOrchestrator:
 
         lines.append("\nA real digest would send these to Claude for summarization.")
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def _cron_test_moltbook_stats(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Poll Moltbook API for post stats and show results."""
+        from ..scheduler.moltbook_stats import MoltbookStatsService
+
+        svc: Optional[MoltbookStatsService] = context.bot_data.get(
+            "moltbook_stats_service"
+        )
+        if not svc:
+            await update.message.reply_text("MoltbookStatsService is not available.")
+            return
+
+        await update.message.reply_text("Polling Moltbook API...")
+        await update.message.chat.send_action("typing")
+        result = await svc.run()
+
+        if result.error and not result.has_results:
+            await update.message.reply_text(
+                f"Moltbook stats failed: {escape_html(str(result.error))}",
+                parse_mode="HTML",
+            )
+            return
+
+        header = "📊 <b>Moltbook Performance</b>\n\n"
+        await update.message.reply_text(
+            header + result.build_summary(),
+            parse_mode="HTML",
+        )
+
+    async def agentic_moltbook(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /moltbook command — show post performance stats."""
+        if not update.message or not update.effective_user:
+            return
+
+        args = context.args or []
+        subcmd = args[0].lower() if args else "stats"
+
+        if subcmd != "stats":
+            await update.message.reply_text(
+                "<b>Usage:</b>\n"
+                "<code>/moltbook stats</code> — show post performance",
+                parse_mode="HTML",
+            )
+            return
+
+        from ..scheduler.moltbook_stats import MoltbookStatsService
+
+        svc: Optional[MoltbookStatsService] = context.bot_data.get(
+            "moltbook_stats_service"
+        )
+        if not svc:
+            await update.message.reply_text("MoltbookStatsService is not available.")
+            return
+
+        result = await svc.read_tracker()
+
+        if result.error:
+            await update.message.reply_text(
+                escape_html(str(result.error)),
+                parse_mode="HTML",
+            )
+            return
+
+        if not result.has_results:
+            await update.message.reply_text("No posts tracked yet.")
+            return
+
+        header = "📊 <b>Moltbook Performance</b>\n\n"
+        await update.message.reply_text(
+            header + result.build_summary(),
+            parse_mode="HTML",
+        )
 
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

@@ -27,6 +27,7 @@ from src.notifications.service import NotificationService
 from src.projects import ProjectThreadManager, load_project_registry
 from src.scheduler.heartbeat import HeartbeatService
 from src.scheduler.memory_sync import MemorySyncService
+from src.scheduler.moltbook_stats import MoltbookStatsService
 from src.scheduler.scheduler import JobScheduler
 from src.scheduler.x_digest import XDigestService
 from src.security.audit import AuditLogger, InMemoryAuditStorage
@@ -175,6 +176,11 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         working_directory=config.approved_directory,
     )
 
+    # Moltbook stats service — post performance tracking
+    moltbook_stats_service = MoltbookStatsService(
+        working_directory=config.approved_directory,
+    )
+
     # Memory sync service — event-driven push after Claude writes
     memory_sync_service: Optional[MemorySyncService] = None
     if config.resolved_memory_dir:
@@ -191,6 +197,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         default_user_id=config.allowed_users[0] if config.allowed_users else 0,
         heartbeat_service=heartbeat_service,
         x_digest_service=x_digest_service,
+        moltbook_stats_service=moltbook_stats_service,
         memory_sync_service=memory_sync_service,
         suppress_quiet_heartbeats=True,
     )
@@ -211,7 +218,8 @@ async def create_application(config: Settings) -> Dict[str, Any]:
 
     bot = ClaudeCodeBot(config, dependencies)
 
-    # Memory sync available to all handlers (not just scheduler)
+    # Services available to all handlers (not just scheduler)
+    bot.deps["moltbook_stats_service"] = moltbook_stats_service
     if memory_sync_service:
         bot.deps["memory_sync_service"] = memory_sync_service
 
@@ -233,6 +241,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "security_validator": security_validator,
         "heartbeat_service": heartbeat_service,
         "x_digest_service": x_digest_service,
+        "moltbook_stats_service": moltbook_stats_service,
         "memory_sync_service": memory_sync_service,
     }
 

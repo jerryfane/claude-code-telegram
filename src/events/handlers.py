@@ -13,6 +13,7 @@ import structlog
 from ..claude.facade import ClaudeIntegration
 from ..scheduler.heartbeat import HeartbeatService
 from ..scheduler.memory_sync import MemorySyncService
+from ..scheduler.moltbook_stats import MoltbookStatsService
 from ..scheduler.x_digest import XDigestService
 from .bus import Event, EventBus
 from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
@@ -39,6 +40,7 @@ class AgentHandler:
         default_user_id: int = 0,
         heartbeat_service: Optional[HeartbeatService] = None,
         x_digest_service: Optional[XDigestService] = None,
+        moltbook_stats_service: Optional[MoltbookStatsService] = None,
         memory_sync_service: Optional[MemorySyncService] = None,
         suppress_quiet_heartbeats: bool = True,
     ) -> None:
@@ -48,6 +50,7 @@ class AgentHandler:
         self.default_user_id = default_user_id
         self.heartbeat = heartbeat_service
         self.x_digest = x_digest_service
+        self.moltbook_stats = moltbook_stats_service
         self.memory_sync = memory_sync_service
         self.suppress_quiet_heartbeats = suppress_quiet_heartbeats
 
@@ -116,6 +119,11 @@ class AgentHandler:
         # X/Twitter digest: search then summarize with Claude
         if event.skill_name == "x_digest" and self.x_digest:
             await self._handle_x_digest(event)
+            return
+
+        # Moltbook stats: poll API for post performance (no Claude needed)
+        if event.skill_name == "moltbook_stats" and self.moltbook_stats:
+            await self._handle_moltbook_stats(event)
             return
 
         prompt = event.prompt
@@ -264,6 +272,46 @@ class AgentHandler:
         except Exception:
             logger.exception(
                 "X digest handler failed",
+                job_id=event.job_id,
+                event_id=event.id,
+            )
+
+    async def _handle_moltbook_stats(self, event: ScheduledEvent) -> None:
+        """Poll Moltbook API for post stats — no Claude needed, pure data."""
+        assert self.moltbook_stats is not None
+
+        try:
+            result = await self.moltbook_stats.run()
+
+            if result.error and not result.has_results:
+                logger.error("Moltbook stats failed", error=result.error)
+                await self._broadcast_response(
+                    event.target_chat_ids,
+                    f"Moltbook stats failed: {result.error}",
+                    event.id,
+                )
+                return
+
+            if not result.has_results:
+                logger.info("Moltbook stats: no posts tracked")
+                await self._broadcast_response(
+                    event.target_chat_ids,
+                    "Moltbook stats: no posts tracked yet.",
+                    event.id,
+                )
+                return
+
+            summary = result.build_summary()
+            header = f"📊 <b>Moltbook Performance</b>\n\n"
+            await self._broadcast_response(
+                event.target_chat_ids,
+                header + summary,
+                event.id,
+            )
+
+        except Exception:
+            logger.exception(
+                "Moltbook stats handler failed",
                 job_id=event.job_id,
                 event_id=event.id,
             )
