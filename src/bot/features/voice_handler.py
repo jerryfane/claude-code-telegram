@@ -132,7 +132,7 @@ class VoiceHandler:
             return self._mistral_client
 
         try:
-            from mistralai import Mistral
+            from mistralai.client import Mistral
         except ModuleNotFoundError as exc:
             raise RuntimeError(
                 "Optional dependency 'mistralai' is missing for voice transcription. "
