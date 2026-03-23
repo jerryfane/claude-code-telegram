@@ -67,6 +67,7 @@ TRAP_WORDS = [
     "soften",
     "mortgage",
 ]
+TRAP_WORDS_SET = set(TRAP_WORDS)
 
 # ── Number word mappings ─────────────────────────────────────────────────
 ONES = {
@@ -104,8 +105,14 @@ TENS = {
 }
 
 # ── Operator mappings ────────────────────────────────────────────────────
-ADD_WORDS = {"plus", "adds", "gains", "total", "combined", "increased", "accelerates"}
-SUB_WORDS = {"minus", "slows", "subtracts", "loses", "decreased", "reduces", "drops"}
+ADD_WORDS = {
+    "plus", "adds", "gains", "total", "combined", "increased",
+    "accelerates", "faster", "increases",
+}
+SUB_WORDS = {
+    "minus", "slows", "subtracts", "loses", "decreased", "reduces",
+    "drops", "decelerates", "slower", "decreases",
+}
 MUL_WORDS = {"times", "product", "multiplied", "multiplies"}
 DIV_WORDS = {"divided", "over", "split", "halved"}
 
@@ -114,12 +121,67 @@ def _log(msg: str) -> None:
     print(f"[moltbook_api] {msg}", file=sys.stderr, flush=True)
 
 
+def _normalize(text: str) -> str:
+    """Normalize mangled challenge text before any parsing.
+
+    Strips all non-alphabetic, non-digit, non-space characters, collapses
+    spaces, lowercases, then merges fragmented tokens back into known words.
+
+    "tW/eN tY" -> "twenty", "lOo.bS tTeRr" -> "lobster", "T hR Ee" -> "three"
+    """
+    # Keep only letters, digits, and spaces
+    cleaned = re.sub(r"[^a-zA-Z0-9 ]", "", text)
+    # Collapse multiple spaces and lowercase
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
+    # Merge fragmented tokens into known words
+    cleaned = _merge_fragments(cleaned)
+    return cleaned
+
+
+# All words the solver needs to recognize (for fragment merging)
+_KNOWN_WORDS = (
+    set(ONES.keys())
+    | set(TENS.keys())
+    | TRAP_WORDS_SET
+    | ADD_WORDS
+    | SUB_WORDS
+    | MUL_WORDS
+    | DIV_WORDS
+    | {"hundred"}
+)
+
+
+def _merge_fragments(text: str) -> str:
+    """Greedily merge adjacent tokens into known words.
+
+    Moltbook splits words with spaces: "twen ty" -> "twenty",
+    "lob ster" -> "lobster", "th ree" -> "three".
+    """
+    tokens = text.split()
+    result: list[str] = []
+    i = 0
+    while i < len(tokens):
+        merged = False
+        # Try merging up to 4 adjacent tokens (handles extreme splits like "t h r e e")
+        for span in range(min(5, len(tokens) - i), 1, -1):
+            candidate = "".join(tokens[i : i + span])
+            if candidate in _KNOWN_WORDS:
+                result.append(candidate)
+                i += span
+                merged = True
+                break
+        if not merged:
+            result.append(tokens[i])
+            i += 1
+    return " ".join(result)
+
+
 def _remove_trap_words(text: str) -> str:
-    """Remove trap words from challenge text before parsing."""
+    """Remove trap words from already-normalized text."""
     cleaned = text
     for word in TRAP_WORDS:
-        # Remove trap words (case-insensitive, whole word)
-        cleaned = re.sub(rf"\b{word}\b", " ", cleaned, flags=re.IGNORECASE)
+        # Simple word boundary match on normalized (lowercase, clean) text
+        cleaned = re.sub(rf"\b{word}\b", " ", cleaned)
     # Collapse multiple spaces
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned
@@ -195,7 +257,9 @@ def solve_verification(challenge_text: str) -> Optional[str]:
 
     Returns the answer as string (e.g. "42.00") or None if unsolvable.
     """
-    cleaned = _remove_trap_words(challenge_text)
+    normalized = _normalize(challenge_text)
+    _log(f"After normalization: {normalized}")
+    cleaned = _remove_trap_words(normalized)
     _log(f"After trap removal: {cleaned}")
 
     operator = _detect_operator(cleaned)
