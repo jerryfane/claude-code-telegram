@@ -157,11 +157,66 @@ _KNOWN_WORDS = (
 )
 
 
+def _dedup_chars(word: str) -> Optional[str]:
+    """Progressively collapse repeated consecutive characters until a known word emerges.
+
+    "tweentyy" -> "twenty", "fiveee" -> "five", "acceelerates" -> "accelerates"
+    """
+    if word in _KNOWN_WORDS:
+        return word
+
+    # Find all positions with repeated consecutive chars
+    repeat_positions: list[int] = []
+    for j in range(len(word) - 1):
+        if word[j] == word[j + 1]:
+            repeat_positions.append(j + 1)  # Index of the duplicate
+
+    if not repeat_positions:
+        return None
+
+    # Only attempt dedup on words longer than the shortest known word they
+    # could match — skip short words like "plus", "five" to avoid over-reduction.
+    # Strategy: try removing chars that appear consecutively OR that create a
+    # known word when removed from the end (suffix trimming).
+
+    # 1. Consecutive-char dedup (safe, handles "fiveee" -> "five")
+    candidates = {word}
+    seen: set[str] = {word}
+    for _ in range(4):
+        next_candidates: set[str] = set()
+        for candidate in candidates:
+            for j in range(len(candidate) - 1):
+                if candidate[j] == candidate[j + 1]:
+                    reduced = candidate[:j] + candidate[j + 1 :]
+                    if reduced in _KNOWN_WORDS:
+                        return reduced
+                    if reduced not in seen and len(reduced) >= 3:
+                        seen.add(reduced)
+                        next_candidates.add(reduced)
+        candidates = next_candidates
+        if not candidates:
+            break
+
+    # 2. Suffix/prefix trimming — remove chars from ends (handles "newtonss")
+    for trim in range(1, min(4, len(word) - 2)):
+        # Trim from end
+        trimmed = word[:-trim]
+        if trimmed in _KNOWN_WORDS:
+            return trimmed
+        # Trim from start
+        trimmed = word[trim:]
+        if trimmed in _KNOWN_WORDS:
+            return trimmed
+
+    return None
+
+
 def _merge_fragments(text: str) -> str:
     """Greedily merge adjacent tokens into known words.
 
     Moltbook splits words with spaces: "twen ty" -> "twenty",
     "lob ster" -> "lobster", "th ree" -> "three".
+    Also handles character duplication: "tweentyy" -> "twenty".
     """
     tokens = text.split()
     result: list[str] = []
@@ -176,8 +231,20 @@ def _merge_fragments(text: str) -> str:
                 i += span
                 merged = True
                 break
+            # Try dedup on the merged candidate
+            deduped = _dedup_chars(candidate)
+            if deduped:
+                result.append(deduped)
+                i += span
+                merged = True
+                break
         if not merged:
-            result.append(tokens[i])
+            # Try dedup on a single token
+            deduped = _dedup_chars(tokens[i])
+            if deduped:
+                result.append(deduped)
+            else:
+                result.append(tokens[i])
             i += 1
     return " ".join(result)
 
