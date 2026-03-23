@@ -129,8 +129,14 @@ def _normalize(text: str) -> str:
 
     "tW/eN tY" -> "twenty", "lOo.bS tTeRr" -> "lobster", "T hR Ee" -> "three"
     """
+    # Preserve literal math operators when used as operators (surrounded by
+    # spaces/digits), not when embedded in words (tW/eN = slash inside word)
+    cleaned = re.sub(r"(?<=\d)\s*\+\s*(?=\d)", " plus ", text)
+    cleaned = re.sub(r"(?<=\d)\s*-\s*(?=\d)", " minus ", cleaned)
+    cleaned = re.sub(r"(?<=\d)\s*\*\s*(?=\d)", " times ", cleaned)
+    cleaned = re.sub(r"(?<=\d)\s*/\s*(?=\d)", " divided ", cleaned)
     # Keep only letters, digits, and spaces
-    cleaned = re.sub(r"[^a-zA-Z0-9 ]", "", text)
+    cleaned = re.sub(r"[^a-zA-Z0-9 ]", "", cleaned)
     # Collapse multiple spaces and lowercase
     cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
     # Merge fragmented tokens into known words
@@ -233,16 +239,22 @@ def _parse_number_word(text: str) -> Optional[float]:
 
 
 def _detect_operator(text: str) -> Optional[str]:
-    """Find the math operator in the challenge text."""
+    """Find the math operator in the challenge text.
+
+    Checks mul/div before add/sub — "times" and "divided" are unambiguous
+    operator words, while add/sub words (e.g. "total", "drops") can appear
+    in non-math context. This prevents "four times" from matching "total"
+    when "times" is the actual operator.
+    """
     words = set(text.lower().split())
-    if words & ADD_WORDS:
-        return "+"
-    if words & SUB_WORDS:
-        return "-"
     if words & MUL_WORDS:
         return "*"
     if words & DIV_WORDS:
         return "/"
+    if words & ADD_WORDS:
+        return "+"
+    if words & SUB_WORDS:
+        return "-"
     return None
 
 
