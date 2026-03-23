@@ -952,10 +952,13 @@ class MessageOrchestrator:
                 force_new=force_new,
             )
 
-            # Fire-and-forget memory sync (non-blocking)
+            # Fire-and-forget memory sync + reminder pickup (non-blocking)
             memory_sync = context.bot_data.get("memory_sync_service")
             if memory_sync:
                 asyncio.create_task(memory_sync.sync_if_needed())
+            reminder_svc = context.bot_data.get("reminder_service")
+            if reminder_svc:
+                asyncio.create_task(reminder_svc.process_pending())
 
             # New session created successfully — clear the one-shot flag
             if force_new:
@@ -1230,10 +1233,13 @@ class MessageOrchestrator:
                 force_new=force_new,
             )
 
-            # Fire-and-forget memory sync (non-blocking)
+            # Fire-and-forget memory sync + reminder pickup (non-blocking)
             memory_sync = context.bot_data.get("memory_sync_service")
             if memory_sync:
                 asyncio.create_task(memory_sync.sync_if_needed())
+            reminder_svc = context.bot_data.get("reminder_service")
+            if reminder_svc:
+                asyncio.create_task(reminder_svc.process_pending())
 
             if force_new:
                 context.user_data["force_new_session"] = False
@@ -1479,10 +1485,13 @@ class MessageOrchestrator:
         finally:
             heartbeat.cancel()
 
-        # Fire-and-forget memory sync (non-blocking)
+        # Fire-and-forget memory sync + reminder pickup (non-blocking)
         memory_sync = context.bot_data.get("memory_sync_service")
         if memory_sync:
             asyncio.create_task(memory_sync.sync_if_needed())
+        reminder_svc = context.bot_data.get("reminder_service")
+        if reminder_svc:
+            asyncio.create_task(reminder_svc.process_pending())
 
         if force_new:
             context.user_data["force_new_session"] = False

@@ -29,6 +29,7 @@ from src.scheduler.heartbeat import HeartbeatService
 from src.scheduler.memory_sync import MemorySyncService
 from src.scheduler.moltbook_notify import MoltbookNotifyService
 from src.scheduler.moltbook_stats import MoltbookStatsService
+from src.scheduler.reminder import ReminderService
 from src.scheduler.scheduler import JobScheduler
 from src.scheduler.x_digest import XDigestService
 from src.security.audit import AuditLogger, InMemoryAuditStorage
@@ -372,6 +373,20 @@ async def run_application(app: Dict[str, Any]) -> None:
             bot.deps["scheduler"] = scheduler
             bot.deps["heartbeat_service"] = heartbeat_service
             bot.deps["x_digest_service"] = x_digest_service
+
+            # Reminder service — needs scheduler reference
+            reminder_service = ReminderService(scheduler=scheduler)
+            agent_handler: AgentHandler = app["agent_handler"]
+            agent_handler.reminder = reminder_service
+            bot.deps["reminder_service"] = reminder_service
+
+            # Process any pending reminders from before restart
+            try:
+                count = await reminder_service.process_pending()
+                if count:
+                    logger.info("Loaded pending reminders", count=count)
+            except Exception as e:
+                logger.warning("Failed to process pending reminders", error=str(e))
 
             # Seed a default heartbeat job on first start
             try:

@@ -13,6 +13,7 @@ from apscheduler.schedulers.asyncio import (
     AsyncIOScheduler,  # type: ignore[import-untyped]
 )
 from apscheduler.triggers.cron import CronTrigger  # type: ignore[import-untyped]
+from apscheduler.triggers.date import DateTrigger  # type: ignore[import-untyped]
 
 from ..events.bus import EventBus
 from ..events.types import ScheduledEvent
@@ -107,6 +108,58 @@ class JobScheduler:
         )
         return str(job.id)
 
+    async def add_reminder(
+        self,
+        reminder_id: str,
+        reminder_name: str,
+        fire_at: datetime,
+        message: str,
+        target_chat_ids: Optional[List[int]] = None,
+        created_by: int = 0,
+    ) -> str:
+        """Add a one-shot reminder that fires at a specific time.
+
+        Uses DateTrigger instead of CronTrigger. Auto-deactivated after firing.
+        """
+        trigger = DateTrigger(run_date=fire_at)
+        work_dir = self.default_working_directory
+
+        self._scheduler.add_job(
+            self._fire_reminder,
+            trigger=trigger,
+            kwargs={
+                "job_id": reminder_id,
+                "job_name": reminder_name,
+                "prompt": message,
+                "working_directory": str(work_dir),
+                "target_chat_ids": target_chat_ids or [],
+                "created_by": created_by,
+            },
+            id=reminder_id,
+            name=reminder_name,
+            replace_existing=True,
+        )
+
+        # Persist to database (cron_expression holds ISO datetime for reminders)
+        await self._save_job(
+            job_id=reminder_id,
+            job_name=reminder_name,
+            cron_expression=fire_at.isoformat(),
+            prompt=message,
+            target_chat_ids=target_chat_ids or [],
+            working_directory=str(work_dir),
+            skill_name="reminder",
+            created_by=created_by,
+        )
+
+        logger.info(
+            "Reminder scheduled",
+            job_id=reminder_id,
+            fire_at=fire_at.isoformat(),
+            message=message[:50],
+        )
+        return reminder_id
+
     async def remove_job(self, job_id: str) -> bool:
         """Remove a scheduled job."""
         try:
@@ -192,6 +245,33 @@ class JobScheduler:
 
         await self.event_bus.publish(event)
 
+    async def _fire_reminder(
+        self,
+        job_id: str,
+        job_name: str,
+        prompt: str,
+        working_directory: str,
+        target_chat_ids: List[int],
+        created_by: int = 0,
+    ) -> None:
+        """Called by APScheduler when a reminder fires. Publishes event and auto-deactivates."""
+        event = ScheduledEvent(
+            job_id=job_id,
+            job_name=job_name,
+            prompt=prompt,
+            working_directory=Path(working_directory),
+            target_chat_ids=target_chat_ids,
+            skill_name="reminder",
+            user_id=created_by,
+        )
+
+        logger.info("Reminder fired", job_id=job_id, job_name=job_name)
+        await self.event_bus.publish(event)
+
+        # Auto-deactivate one-shot reminder in DB
+        await self._delete_job(job_id)
+        logger.info("Reminder auto-deactivated", job_id=job_id)
+
     async def _load_jobs_from_db(self) -> None:
         """Load persisted jobs and re-register them with APScheduler."""
         try:
@@ -204,7 +284,21 @@ class JobScheduler:
             for row in rows:
                 row_dict = dict(row)
                 try:
-                    trigger = CronTrigger.from_crontab(row_dict["cron_expression"])
+                    # Reminders use DateTrigger; cron jobs use CronTrigger
+                    if row_dict.get("skill_name") == "reminder":
+                        fire_at = datetime.fromisoformat(row_dict["cron_expression"])
+                        if fire_at.tzinfo is None:
+                            fire_at = fire_at.replace(tzinfo=UTC)
+                        if fire_at <= datetime.now(UTC):
+                            # Expired reminder — deactivate silently
+                            logger.debug(
+                                "Skipping expired reminder",
+                                job_id=row_dict["job_id"],
+                            )
+                            continue
+                        trigger = DateTrigger(run_date=fire_at)
+                    else:
+                        trigger = CronTrigger.from_crontab(row_dict["cron_expression"])
 
                     # Parse target_chat_ids from stored string
                     chat_ids_str = row_dict.get("target_chat_ids", "")

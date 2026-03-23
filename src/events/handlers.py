@@ -15,6 +15,7 @@ from ..scheduler.heartbeat import HeartbeatService
 from ..scheduler.memory_sync import MemorySyncService
 from ..scheduler.moltbook_notify import MoltbookNotifyService
 from ..scheduler.moltbook_stats import MoltbookStatsService
+from ..scheduler.reminder import ReminderService
 from ..scheduler.x_digest import XDigestService
 from .bus import Event, EventBus
 from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
@@ -43,6 +44,7 @@ class AgentHandler:
         x_digest_service: Optional[XDigestService] = None,
         moltbook_stats_service: Optional[MoltbookStatsService] = None,
         moltbook_notify_service: Optional[MoltbookNotifyService] = None,
+        reminder_service: Optional[ReminderService] = None,
         memory_sync_service: Optional[MemorySyncService] = None,
         suppress_quiet_heartbeats: bool = True,
     ) -> None:
@@ -54,6 +56,7 @@ class AgentHandler:
         self.x_digest = x_digest_service
         self.moltbook_stats = moltbook_stats_service
         self.moltbook_notify = moltbook_notify_service
+        self.reminder = reminder_service
         self.memory_sync = memory_sync_service
         self.suppress_quiet_heartbeats = suppress_quiet_heartbeats
 
@@ -122,6 +125,11 @@ class AgentHandler:
         # X/Twitter digest: search then summarize with Claude
         if event.skill_name == "x_digest" and self.x_digest:
             await self._handle_x_digest(event)
+            return
+
+        # Reminder: one-shot delivery, no Claude needed ($0)
+        if event.skill_name == "reminder":
+            await self._handle_reminder(event)
             return
 
         # Moltbook notify: lightweight check, only invoke Claude if unread > 0
@@ -376,10 +384,27 @@ class AgentHandler:
                 event_id=event.id,
             )
 
+    async def _handle_reminder(self, event: ScheduledEvent) -> None:
+        """Deliver a one-shot reminder — no Claude, just send the message ($0)."""
+        message = event.prompt
+        if not message:
+            return
+
+        header = "🔔 <b>Reminder</b>\n\n"
+        await self._broadcast_response(
+            event.target_chat_ids,
+            header + message,
+            event.id,
+        )
+        logger.info("Reminder delivered", job_id=event.job_id)
+        # Auto-deactivation happens in scheduler._fire_reminder()
+
     def _fire_memory_sync(self) -> None:
-        """Fire-and-forget memory sync after Claude may have written files."""
+        """Fire-and-forget memory sync and reminder processing after Claude response."""
         if self.memory_sync:
             asyncio.create_task(self.memory_sync.sync_if_needed())
+        if self.reminder:
+            asyncio.create_task(self.reminder.process_pending())
 
     async def _broadcast_response(
         self,
