@@ -1711,6 +1711,8 @@ class MessageOrchestrator:
         /cron test x_digest             — dry-run X search (no Claude)
         /cron moltbook_stats <cron>     — add a Moltbook stats polling job
         /cron test moltbook_stats       — poll Moltbook stats now
+        /cron moltbook_notify <cron>    — add a Moltbook notification check job
+        /cron test moltbook_notify      — check notifications now (no Claude)
         """
         from ..scheduler.scheduler import JobScheduler
 
@@ -1741,6 +1743,9 @@ class MessageOrchestrator:
                 return
             if test_target == "moltbook_stats":
                 await self._cron_test_moltbook_stats(update, context)
+                return
+            if test_target == "moltbook_notify":
+                await self._cron_test_moltbook_notify(update, context)
                 return
 
         if subcmd == "heartbeat":
@@ -1819,6 +1824,34 @@ class MessageOrchestrator:
                 )
                 await update.message.reply_text(
                     f"Moltbook stats job added.\n"
+                    f"ID: <code>{escape_html(job_id)}</code>\n"
+                    f"Schedule: <code>{escape_html(cron_expr)}</code>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                await update.message.reply_text(f"Failed to add job: {e}")
+            return
+
+        if subcmd == "moltbook_notify":
+            cron_expr = " ".join(raw_args[1:])
+            if not cron_expr:
+                await update.message.reply_text(
+                    "Usage: <code>/cron moltbook_notify */30 * * * *</code>",
+                    parse_mode="HTML",
+                )
+                return
+            try:
+                config = self.settings
+                job_id = await scheduler.add_job(
+                    job_name="Moltbook Notify",
+                    cron_expression=cron_expr,
+                    prompt="",
+                    target_chat_ids=config.notification_chat_ids or [],
+                    skill_name="moltbook_notify",
+                    created_by=update.effective_user.id,
+                )
+                await update.message.reply_text(
+                    f"Moltbook notify job added.\n"
                     f"ID: <code>{escape_html(job_id)}</code>\n"
                     f"Schedule: <code>{escape_html(cron_expr)}</code>",
                     parse_mode="HTML",
@@ -1911,7 +1944,9 @@ class MessageOrchestrator:
             "<code>/cron test heartbeat</code> — dry-run Phase 1 checks\n"
             "<code>/cron test x_digest</code> — dry-run X search\n"
             "<code>/cron moltbook_stats &lt;cron&gt;</code> — add Moltbook stats job\n"
-            "<code>/cron test moltbook_stats</code> — poll Moltbook stats now",
+            "<code>/cron test moltbook_stats</code> — poll Moltbook stats now\n"
+            "<code>/cron moltbook_notify &lt;cron&gt;</code> — add notify check job\n"
+            "<code>/cron test moltbook_notify</code> — check notifications now",
             parse_mode="HTML",
         )
 
@@ -2060,6 +2095,46 @@ class MessageOrchestrator:
             header + result.build_summary(),
             parse_mode="HTML",
         )
+
+    async def _cron_test_moltbook_notify(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Check Moltbook notifications (no Claude — just show count)."""
+        from ..scheduler.moltbook_notify import MoltbookNotifyService
+
+        svc: Optional[MoltbookNotifyService] = context.bot_data.get(
+            "moltbook_notify_service"
+        )
+        if not svc:
+            await update.message.reply_text("MoltbookNotifyService is not available.")
+            return
+
+        await update.message.reply_text("Checking Moltbook notifications...")
+        await update.message.chat.send_action("typing")
+        result = await svc.check()
+
+        if result.error:
+            await update.message.reply_text(
+                f"Notify check failed: {escape_html(str(result.error))}",
+                parse_mode="HTML",
+            )
+            return
+
+        if not result.has_notifications:
+            await update.message.reply_text(
+                f"🔔 No unread notifications. Karma: {result.karma}",
+            )
+            return
+
+        lines = [
+            f"🔔 <b>{result.unread_count} unread notification(s)</b> (karma: {result.karma})\n"
+        ]
+        for n in result.notifications[:10]:
+            ntype = n.get("type", "?")
+            agent = n.get("from_agent", {}).get("name", "?") if isinstance(n.get("from_agent"), dict) else "?"
+            lines.append(f"• [{ntype}] from @{escape_html(agent)}")
+        lines.append("\nA real run would invoke Claude to reply to these.")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def agentic_moltbook(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

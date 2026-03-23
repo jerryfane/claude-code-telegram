@@ -27,6 +27,7 @@ from src.notifications.service import NotificationService
 from src.projects import ProjectThreadManager, load_project_registry
 from src.scheduler.heartbeat import HeartbeatService
 from src.scheduler.memory_sync import MemorySyncService
+from src.scheduler.moltbook_notify import MoltbookNotifyService
 from src.scheduler.moltbook_stats import MoltbookStatsService
 from src.scheduler.scheduler import JobScheduler
 from src.scheduler.x_digest import XDigestService
@@ -181,6 +182,11 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         working_directory=config.approved_directory,
     )
 
+    # Moltbook notify service — lightweight notification check
+    moltbook_notify_service = MoltbookNotifyService(
+        working_directory=config.approved_directory,
+    )
+
     # Memory sync service — event-driven push after Claude writes
     memory_sync_service: Optional[MemorySyncService] = None
     if config.resolved_memory_dir:
@@ -198,6 +204,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         heartbeat_service=heartbeat_service,
         x_digest_service=x_digest_service,
         moltbook_stats_service=moltbook_stats_service,
+        moltbook_notify_service=moltbook_notify_service,
         memory_sync_service=memory_sync_service,
         suppress_quiet_heartbeats=True,
     )
@@ -220,6 +227,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
 
     # Services available to all handlers (not just scheduler)
     bot.deps["moltbook_stats_service"] = moltbook_stats_service
+    bot.deps["moltbook_notify_service"] = moltbook_notify_service
     if memory_sync_service:
         bot.deps["memory_sync_service"] = memory_sync_service
 
@@ -242,6 +250,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         "heartbeat_service": heartbeat_service,
         "x_digest_service": x_digest_service,
         "moltbook_stats_service": moltbook_stats_service,
+        "moltbook_notify_service": moltbook_notify_service,
         "memory_sync_service": memory_sync_service,
     }
 

@@ -13,6 +13,7 @@ import structlog
 from ..claude.facade import ClaudeIntegration
 from ..scheduler.heartbeat import HeartbeatService
 from ..scheduler.memory_sync import MemorySyncService
+from ..scheduler.moltbook_notify import MoltbookNotifyService
 from ..scheduler.moltbook_stats import MoltbookStatsService
 from ..scheduler.x_digest import XDigestService
 from .bus import Event, EventBus
@@ -41,6 +42,7 @@ class AgentHandler:
         heartbeat_service: Optional[HeartbeatService] = None,
         x_digest_service: Optional[XDigestService] = None,
         moltbook_stats_service: Optional[MoltbookStatsService] = None,
+        moltbook_notify_service: Optional[MoltbookNotifyService] = None,
         memory_sync_service: Optional[MemorySyncService] = None,
         suppress_quiet_heartbeats: bool = True,
     ) -> None:
@@ -51,6 +53,7 @@ class AgentHandler:
         self.heartbeat = heartbeat_service
         self.x_digest = x_digest_service
         self.moltbook_stats = moltbook_stats_service
+        self.moltbook_notify = moltbook_notify_service
         self.memory_sync = memory_sync_service
         self.suppress_quiet_heartbeats = suppress_quiet_heartbeats
 
@@ -119,6 +122,11 @@ class AgentHandler:
         # X/Twitter digest: search then summarize with Claude
         if event.skill_name == "x_digest" and self.x_digest:
             await self._handle_x_digest(event)
+            return
+
+        # Moltbook notify: lightweight check, only invoke Claude if unread > 0
+        if event.skill_name == "moltbook_notify" and self.moltbook_notify:
+            await self._handle_moltbook_notify(event)
             return
 
         # Moltbook stats: poll API for post performance (no Claude needed)
@@ -272,6 +280,58 @@ class AgentHandler:
         except Exception:
             logger.exception(
                 "X digest handler failed",
+                job_id=event.job_id,
+                event_id=event.id,
+            )
+
+    async def _handle_moltbook_notify(self, event: ScheduledEvent) -> None:
+        """Two-phase Moltbook notification check: cheap API call first, Claude only if unread."""
+        assert self.moltbook_notify is not None
+
+        try:
+            result = await self.moltbook_notify.check()
+
+            if result.error:
+                logger.error("Moltbook notify check failed", error=result.error)
+                return
+
+            if not result.has_notifications:
+                # All quiet — no Claude invocation, $0
+                logger.info(
+                    "Moltbook notify: no unread notifications",
+                    karma=result.karma,
+                )
+                return
+
+            # Unread notifications — invoke Claude to respond
+            prompt = result.build_prompt()
+            logger.info(
+                "Moltbook notify: unread notifications, invoking Claude",
+                unread_count=result.unread_count,
+            )
+
+            working_dir = event.working_directory or self.default_working_directory
+            user_id = event.user_id or self.default_user_id
+            response = await self.claude.run_command(
+                prompt=prompt,
+                working_directory=working_dir,
+                user_id=user_id,
+            )
+            self._fire_memory_sync()
+
+            if response.content:
+                header = (
+                    f"🔔 <b>Moltbook — {result.unread_count} notification(s)</b>\n\n"
+                )
+                await self._broadcast_response(
+                    event.target_chat_ids,
+                    header + response.content,
+                    event.id,
+                )
+
+        except Exception:
+            logger.exception(
+                "Moltbook notify handler failed",
                 job_id=event.job_id,
                 event_id=event.id,
             )
