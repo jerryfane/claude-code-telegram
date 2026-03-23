@@ -116,6 +116,23 @@ SUB_WORDS = {
 MUL_WORDS = {"times", "product", "multiplied", "multiplies"}
 DIV_WORDS = {"divided", "over", "split", "halved"}
 
+# Multi-word operator phrases (checked before single words)
+MULTI_WORD_OPS: dict[str, list[str]] = {
+    "*": ["scaled by", "multiplied by"],
+    "/": ["divided by", "split by"],
+    "+": ["speeds up", "adds up", "goes up", "moves up"],
+    "-": ["slows down", "goes down", "drops by", "falls by"],
+}
+
+# Nouns that make a preceding number a descriptor, not an operand
+# "one claw" = descriptor, "twenty three" = operand
+DESCRIPTOR_NOUNS = {
+    "claw", "claws", "hand", "hands", "arm", "arms",
+    "side", "sides", "leg", "legs", "eye", "eyes",
+    "wing", "wings", "fin", "fins", "tail", "tails",
+    "antenna", "antennae",
+}
+
 
 def _log(msg: str) -> None:
     print(f"[moltbook_api] {msg}", file=sys.stderr, flush=True)
@@ -308,12 +325,21 @@ def _parse_number_word(text: str) -> Optional[float]:
 def _detect_operator(text: str) -> Optional[str]:
     """Find the math operator in the challenge text.
 
+    Checks multi-word phrases first, then single words.
     Checks mul/div before add/sub — "times" and "divided" are unambiguous
     operator words, while add/sub words (e.g. "total", "drops") can appear
-    in non-math context. This prevents "four times" from matching "total"
-    when "times" is the actual operator.
+    in non-math context.
     """
-    words = set(text.lower().split())
+    lower = text.lower()
+
+    # Multi-word phrases first (mul/div before add/sub)
+    for op in ["*", "/", "+", "-"]:
+        for phrase in MULTI_WORD_OPS.get(op, []):
+            if phrase in lower:
+                return op
+
+    # Single words (mul/div before add/sub)
+    words = set(lower.split())
     if words & MUL_WORDS:
         return "*"
     if words & DIV_WORDS:
@@ -323,6 +349,37 @@ def _detect_operator(text: str) -> Optional[str]:
     if words & SUB_WORDS:
         return "-"
     return None
+
+
+def _filter_descriptor_numbers(numbers: list[float], text: str) -> list[float]:
+    """Remove numbers that are descriptors rather than operands.
+
+    "twenty three newtons with one claw plus seventeen"
+    -> "one" is followed by "claw" (descriptor noun), so exclude 1.0
+    -> returns [23.0, 17.0]
+
+    Only applies when >2 candidates — challenges always need exactly 2 operands.
+    """
+    if len(numbers) <= 2:
+        return numbers
+
+    words = text.lower().split()
+    # Build a set of number values that appear before descriptor nouns
+    descriptor_values: set[float] = set()
+    for i, word in enumerate(words):
+        if i + 1 < len(words) and words[i + 1] in DESCRIPTOR_NOUNS:
+            parsed = _parse_number_word(word)
+            if parsed is not None:
+                descriptor_values.add(parsed)
+
+    if not descriptor_values:
+        return numbers
+
+    # Remove descriptor numbers, but keep at least 2
+    filtered = [n for n in numbers if n not in descriptor_values]
+    if len(filtered) >= 2:
+        return filtered
+    return numbers
 
 
 def solve_verification(challenge_text: str) -> Optional[str]:
@@ -359,36 +416,33 @@ def solve_verification(challenge_text: str) -> Optional[str]:
 
     numbers: list[float] = []
 
-    # Prefer digit matches if we have 2+
-    if len(digit_matches) >= 2:
-        numbers = [float(d) for d in digit_matches[:2]]
-    elif digit_matches and word_matches:
-        # Mix of digits and words
-        numbers.append(float(digit_matches[0]))
-        parsed = _parse_number_word(word_matches[0])
-        if parsed is not None:
-            numbers.append(parsed)
-    elif len(word_matches) >= 2:
-        for wm in word_matches[:2]:
+    # Collect ALL number candidates (digits + words), then filter
+    if digit_matches and not word_matches:
+        numbers = [float(d) for d in digit_matches]
+    elif word_matches and not digit_matches:
+        for wm in word_matches:
             parsed = _parse_number_word(wm)
             if parsed is not None:
                 numbers.append(parsed)
-    elif len(digit_matches) == 1 and len(word_matches) == 0:
-        # Only one number found - look harder for word numbers
-        numbers.append(float(digit_matches[0]))
-        # Scan all words for a number
-        for word in cleaned.lower().split():
-            parsed = _parse_number_word(word)
-            if parsed is not None and parsed != numbers[0]:
-                numbers.append(parsed)
-                break
-    elif len(word_matches) == 1:
-        parsed = _parse_number_word(word_matches[0])
-        if parsed is not None:
-            numbers.append(parsed)
+    elif digit_matches and word_matches:
+        # Mix: collect all, deduplicate
         for d in digit_matches:
             numbers.append(float(d))
-            break
+        for wm in word_matches:
+            parsed = _parse_number_word(wm)
+            if parsed is not None and parsed not in numbers:
+                numbers.append(parsed)
+    else:
+        # Last resort: scan all words
+        for word in cleaned.lower().split():
+            parsed = _parse_number_word(word)
+            if parsed is not None and parsed not in numbers:
+                numbers.append(parsed)
+
+    # Filter out descriptor numbers ("one claw", "two hands") when >2 candidates
+    if len(numbers) > 2:
+        numbers = _filter_descriptor_numbers(numbers, cleaned)
+        _log(f"After descriptor filter: {numbers}")
 
     if len(numbers) < 2:
         _log(f"Found only {len(numbers)} numbers in: {cleaned}")
