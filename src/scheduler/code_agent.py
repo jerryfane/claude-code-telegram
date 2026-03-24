@@ -74,20 +74,20 @@ class CodeAgentSession:
             system_prompt += (
                 f"\nIMPORTANT: You have full edit permissions. "
                 f"Do NOT enter plan mode. Do NOT call EnterPlanMode or ExitPlanMode. "
-                f"Read what you need, then make the changes directly. "
-                f"This is a single-turn execution — plan internally, act immediately.\n"
+                f"Read what you need, then make the changes directly.\n"
             )
 
         cmd = [
             self.cli_path,
             "-p",
             "--output-format", "stream-json",
+            "--input-format", "stream-json",
             "--verbose",
             "--permission-mode", self.permission_mode,
             "--max-budget-usd", str(self.max_budget),
             "--system-prompt", system_prompt,
             "--setting-sources", "",
-            self.task,
+            # Task sent via stdin, not as CLI arg (required for stream-json input)
         ]
 
         if self.model:
@@ -116,14 +116,23 @@ class CodeAgentSession:
         self._read_task = asyncio.create_task(self._read_output_loop())
         self._timeout_task = asyncio.create_task(self._timeout_watchdog())
 
+        # Send the task as the first user message
+        await self.send_message(self.task)
+
     async def send_message(self, text: str) -> bool:
-        """Send a steering message to the sub-agent via stdin (stream-json format)."""
+        """Send a user message to the sub-agent via stdin (stream-json format)."""
         if not self._process or self._process.stdin is None:
             return False
         if self.status != "running":
             return False
 
-        msg = json.dumps({"type": "user", "content": text}) + "\n"
+        msg = json.dumps({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": text}],
+            },
+        }) + "\n"
         try:
             self._process.stdin.write(msg.encode())
             await self._process.stdin.drain()
@@ -174,13 +183,13 @@ class CodeAgentSession:
 
                 msg_type = data.get("type", "")
 
-                # Extract result info
+                # Extract result info (but keep session alive for multi-turn)
                 if msg_type == "result":
                     self.total_cost = data.get("total_cost_usd", 0)
                     self.num_turns = data.get("num_turns", 0)
                     self.result_text = data.get("result", "")[:2000]
-                    self.status = "completed"
-                    self.finished_at = datetime.now(UTC)
+                    # Don't mark completed — process stays alive for follow-up messages
+                    # Session ends when: process exits (EOF), kill(), or timeout
 
                 # Forward to callback (Telegram delivery)
                 try:
