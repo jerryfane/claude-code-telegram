@@ -304,10 +304,12 @@ class CodeAgentService:
             await session.kill()
             return True
 
-    async def process_pending_tasks(self) -> int:
+    async def process_pending_tasks(self, override_chat_id: Optional[int] = None) -> int:
         """Pick up pending code tasks written by scripts/code_task.py.
 
         Called as fire-and-forget after each Claude response.
+        override_chat_id: use this chat instead of what the script wrote
+        (auto-detects group vs private based on where the conversation is).
         Returns count of tasks spawned.
         """
         if not self._bot or not self.PENDING_FILE.exists():
@@ -324,7 +326,7 @@ class CodeAgentService:
         spawned = 0
         for task_info in pending:
             try:
-                chat_id = task_info.get("chat_id", 0)
+                chat_id = override_chat_id or task_info.get("chat_id", 0)
                 task = task_info.get("task", "")
                 mode = task_info.get("mode", "build")
 

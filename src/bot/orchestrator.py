@@ -1035,7 +1035,9 @@ class MessageOrchestrator:
                 asyncio.create_task(reminder_svc.process_pending())
             code_svc = context.bot_data.get("code_agent_service")
             if code_svc:
-                asyncio.create_task(code_svc.process_pending_tasks())
+                asyncio.create_task(code_svc.process_pending_tasks(
+                    override_chat_id=update.effective_chat.id
+                ))
 
             # New session created successfully — clear the one-shot flag
             if force_new:
@@ -1329,7 +1331,9 @@ class MessageOrchestrator:
                 asyncio.create_task(reminder_svc.process_pending())
             code_svc = context.bot_data.get("code_agent_service")
             if code_svc:
-                asyncio.create_task(code_svc.process_pending_tasks())
+                asyncio.create_task(code_svc.process_pending_tasks(
+                    override_chat_id=update.effective_chat.id
+                ))
 
             if force_new:
                 context.user_data["force_new_session"] = False
@@ -1594,7 +1598,9 @@ class MessageOrchestrator:
             asyncio.create_task(reminder_svc.process_pending())
         code_svc = context.bot_data.get("code_agent_service")
         if code_svc:
-            asyncio.create_task(code_svc.process_pending_tasks())
+            asyncio.create_task(code_svc.process_pending_tasks(
+                override_chat_id=update.effective_chat.id
+            ))
 
         if force_new:
             context.user_data["force_new_session"] = False
