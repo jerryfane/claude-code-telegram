@@ -49,6 +49,7 @@ class CodeAgentSession:
         self.started_at: Optional[datetime] = None
         self.finished_at: Optional[datetime] = None
         self.status = "pending"  # pending, running, completed, killed, failed
+        self.message_thread_id: Optional[int] = None  # Forum topic thread ID
         self.total_cost: float = 0
         self.num_turns: int = 0
         self.result_text: str = ""

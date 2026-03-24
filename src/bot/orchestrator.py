@@ -876,32 +876,40 @@ class MessageOrchestrator:
         user_id = update.effective_user.id
         message_text = update.message.text
 
-        # Intercept replies to code agent threads — steer the sub-agent
-        if update.message.reply_to_message:
-            chat_id = update.effective_chat.id
-            thread_key = f"_code_agent_thread_{chat_id}"
-            thread_msg_id = context.bot_data.get(thread_key)
-            reply_to_id = update.message.reply_to_message.message_id
+        # Intercept messages in code agent context — steer the sub-agent
+        chat_id = update.effective_chat.id
+        thread_key = f"_code_agent_thread_{chat_id}"
+        thread_info = context.bot_data.get(thread_key)
 
-            if thread_msg_id and reply_to_id:
-                from ..scheduler.code_agent import CodeAgentService
+        is_code_agent_msg = False
+        if thread_info and isinstance(thread_info, dict):
+            if thread_info.get("is_forum") and thread_info.get("message_thread_id"):
+                # Forum mode: any message in the code agent's topic thread
+                msg_thread = getattr(update.message, "message_thread_id", None)
+                if msg_thread == thread_info["message_thread_id"]:
+                    is_code_agent_msg = True
+            elif update.message.reply_to_message:
+                # Private chat mode: reply to the code agent's status message
+                if update.message.reply_to_message.message_id == thread_info.get("message_id"):
+                    is_code_agent_msg = True
 
-                svc: Optional["CodeAgentService"] = context.bot_data.get("code_agent_service")
-                if svc:
-                    session = svc.get_session(chat_id)
-                    if session and session.status == "running":
-                        # Check for kill commands
-                        lower = message_text.strip().lower()
-                        if lower in ("stop", "kill", "abort"):
-                            await svc.kill_session(chat_id)
-                            await update.message.reply_text("Code agent terminated.")
-                            return
+        if is_code_agent_msg:
+            from ..scheduler.code_agent import CodeAgentService
 
-                        # Send as steering input
-                        sent = await session.send_message(message_text)
-                        if sent:
-                            await update.message.reply_text("↪️ Sent to code agent.")
-                            return
+            svc_ca: Optional["CodeAgentService"] = context.bot_data.get("code_agent_service")
+            if svc_ca:
+                session = svc_ca.get_session(chat_id)
+                if session and session.status == "running":
+                    lower = message_text.strip().lower()
+                    if lower in ("stop", "kill", "abort"):
+                        await svc_ca.kill_session(chat_id)
+                        await update.message.reply_text("Code agent terminated.")
+                        return
+
+                    sent = await session.send_message(message_text)
+                    if sent:
+                        await update.message.reply_text("↪️ Sent to code agent.")
+                        return
 
         # Prepend quoted message context when replying to a previous message
         reply_context = extract_reply_context(update.message)
@@ -2342,103 +2350,143 @@ class MessageOrchestrator:
             )
             return
 
-        # Send initial message — replies to this create the thread
         mode_label = "build" if permission_mode == "acceptEdits" else "plan"
-        initial_msg = await update.message.reply_text(
+        chat = update.effective_chat
+        bot = context.bot
+        is_forum = getattr(chat, "is_forum", False)
+
+        # --- Forum group: create a topic for this session ---
+        message_thread_id: Optional[int] = None
+        if is_forum:
+            try:
+                topic = await bot.create_forum_topic(
+                    chat_id=chat_id,
+                    name=f"🤖 Code: {task[:40]}",
+                )
+                message_thread_id = topic.message_thread_id
+            except Exception as e:
+                logger.warning("Failed to create forum topic", error=str(e))
+                # Fall back to main chat
+
+        # Send initial status message
+        send_kwargs: dict = {"parse_mode": "HTML"}
+        if message_thread_id:
+            send_kwargs["message_thread_id"] = message_thread_id
+
+        initial_msg = await chat.send_message(
             f"🤖 <b>Code Agent</b> ({mode_label} mode)\n"
             f"Task: {escape_html(task[:200])}\n\n"
-            f"<i>Streaming output below. Reply to steer. /code kill to stop.</i>",
-            parse_mode="HTML",
+            f"<i>Reply here to steer. /code kill to stop.</i>",
+            **send_kwargs,
         )
 
-        # Track the thread message ID for reply detection
+        # Track for reply/steering detection
         thread_key = f"_code_agent_thread_{chat_id}"
-        context.bot_data[thread_key] = initial_msg.message_id
+        context.bot_data[thread_key] = {
+            "message_id": initial_msg.message_id,
+            "message_thread_id": message_thread_id,
+            "is_forum": is_forum,
+        }
 
-        # Build output callback that sends to Telegram as replies
-        chat = update.effective_chat
-        msg_buffer: list[str] = []
-        last_send_time: list[float] = [0]  # Mutable for closure
+        # --- Build output callback ---
+        import time as _time
+
+        activity_log: list[str] = []
+        last_edit_time: list[float] = [0]
+
+        def _format_tool_line(block: dict) -> str:
+            name = block.get("name", "?")
+            inp = block.get("input", {})
+            if name == "Read":
+                return f"🔧 Read {inp.get('file_path', '?')}"
+            if name == "Edit":
+                return f"✏️ Edit {inp.get('file_path', '?')}"
+            if name == "Write":
+                return f"📝 Write {inp.get('file_path', '?')}"
+            if name == "Bash":
+                return f"⚡ Bash: {inp.get('command', '?')[:80]}"
+            if name in ("Glob", "Grep"):
+                return f"🔍 {name}: {inp.get('pattern', '?')[:60]}"
+            return f"🔧 {name}"
 
         async def _output_callback(data: dict) -> None:
             msg_type = data.get("type", "")
             sub = data.get("subtype", "")
-            text = ""
 
             if msg_type == "assistant":
                 msg_obj = data.get("message", {})
                 for block in msg_obj.get("content", []):
-                    if block.get("type") == "text":
-                        t = block["text"]
-                        if t.strip():
-                            text = t[:500]
-                    elif block.get("type") == "tool_use":
-                        name = block.get("name", "?")
-                        inp = block.get("input", {})
-                        # Format tool calls nicely
-                        if name == "Read":
-                            text = f"🔧 Read {inp.get('file_path', '?')}"
-                        elif name == "Edit":
-                            text = f"✏️ Edit {inp.get('file_path', '?')}"
-                        elif name == "Write":
-                            text = f"📝 Write {inp.get('file_path', '?')}"
-                        elif name == "Bash":
-                            cmd = inp.get("command", "?")[:100]
-                            text = f"⚡ Bash: {cmd}"
-                        elif name in ("Glob", "Grep"):
-                            pattern = inp.get("pattern", "?")[:80]
-                            text = f"🔍 {name}: {pattern}"
-                        else:
-                            text = f"🔧 {name}"
+                    if block.get("type") == "tool_use":
+                        activity_log.append(_format_tool_line(block))
+                    elif block.get("type") == "text":
+                        t = block.get("text", "").strip()
+                        if t:
+                            # Keep last reasoning snippet
+                            activity_log.append(t[:200])
 
             elif msg_type == "result":
+                # Final result — always send as a new message
                 cost = data.get("total_cost_usd", 0)
                 turns = data.get("num_turns", 0)
-                result = data.get("result", "")[:500]
+                result = data.get("result", "")[:1500]
                 is_error = data.get("is_error", False)
                 icon = "❌" if is_error else "✅"
-                text = (
-                    f"{icon} <b>Done</b> — "
-                    f"${cost:.4f}, {turns} turns\n\n{escape_html(result)}"
+                result_text = (
+                    f"{icon} <b>Done</b> — ${cost:.4f}, {turns} turns\n\n"
+                    f"{escape_html(result)}"
                 )
+                try:
+                    msg_kwargs: dict = {"parse_mode": "HTML"}
+                    if message_thread_id:
+                        msg_kwargs["message_thread_id"] = message_thread_id
+                    await chat.send_message(result_text[:4000], **msg_kwargs)
+                except Exception:
+                    logger.debug("Failed to send code agent result")
+
+                # Close forum topic on completion
+                if message_thread_id:
+                    try:
+                        await bot.close_forum_topic(
+                            chat_id=chat_id,
+                            message_thread_id=message_thread_id,
+                        )
+                    except Exception:
+                        logger.debug("Failed to close forum topic")
+                return
 
             elif msg_type == "system" and sub == "timeout":
-                text = f"⏱️ {data.get('message', 'Timed out')}"
+                activity_log.append(f"⏱️ {data.get('message', 'Timed out')}")
 
-            if not text:
+            else:
                 return
 
-            # Throttle: don't send more than 1 msg per 1.5s
-            import time
-            now = time.time()
-            if now - last_send_time[0] < 1.5 and msg_type != "result":
-                msg_buffer.append(text)
-                return
-            last_send_time[0] = now
+            # Update the live status message (edit, not new message)
+            now = _time.time()
+            if now - last_edit_time[0] < 2.0:
+                return  # Throttle edits
+            last_edit_time[0] = now
 
-            # Flush buffer
-            if msg_buffer:
-                text = "\n".join(msg_buffer) + "\n" + text
-                msg_buffer.clear()
-
+            # Build rolling status from last N activity lines
+            recent = activity_log[-15:]
+            status_text = (
+                f"🤖 <b>Code Agent</b> ({mode_label} mode)\n"
+                f"Task: {escape_html(task[:100])}\n\n"
+                + "\n".join(recent[-10:])
+            )
             try:
-                parse = "HTML" if msg_type == "result" else None
-                await chat.send_message(
-                    text[:4000],
-                    reply_to_message_id=initial_msg.message_id,
-                    parse_mode=parse,
-                )
+                await initial_msg.edit_text(status_text[:4000], parse_mode="HTML")
             except Exception:
-                logger.debug("Failed to send code agent output to Telegram")
+                pass  # Edit may fail if content unchanged
 
         # Spawn the session
         try:
-            await svc.spawn(
+            session = await svc.spawn(
                 task=task,
                 chat_id=chat_id,
                 output_callback=_output_callback,
                 permission_mode=permission_mode,
             )
+            session.message_thread_id = message_thread_id
         except Exception as e:
             await update.message.reply_text(f"Failed to spawn code agent: {e}")
 
