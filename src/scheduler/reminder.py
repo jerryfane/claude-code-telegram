@@ -68,6 +68,11 @@ class ReminderService:
                 message = reminder.get("message", "")
                 chat_id = reminder.get("chat_id", 0)
                 reminder_id = reminder.get("id", "")
+                delivery = reminder.get("delivery", "telegram")
+
+                # Encode delivery type as prefix in message
+                if delivery == "relay":
+                    message = f"[RELAY]{message}"
 
                 # Register with APScheduler via DateTrigger
                 await self.scheduler.add_reminder(

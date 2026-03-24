@@ -64,6 +64,7 @@ def cmd_add(args: argparse.Namespace) -> None:
         "message": args.message,
         "chat_id": args.chat,
         "created_at": now.isoformat(),
+        "delivery": "relay" if getattr(args, "relay", False) else "telegram",
     }
 
     pending = _load_pending()
@@ -180,6 +181,7 @@ def main() -> None:
     p_add.add_argument("--at", required=True, help="ISO 8601 datetime (UTC)")
     p_add.add_argument("--message", required=True, help="Reminder message")
     p_add.add_argument("--chat", type=int, required=True, help="Telegram chat ID")
+    p_add.add_argument("--relay", action="store_true", help="Deliver via Relay app instead of Telegram")
 
     # list
     p_list = sub.add_parser("list", help="List reminders")

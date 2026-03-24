@@ -390,14 +390,60 @@ class AgentHandler:
         if not message:
             return
 
+        # Check for Relay delivery prefix
+        use_relay = message.startswith("[RELAY]")
+        if use_relay:
+            message = message[7:]  # Strip prefix
+
+        if use_relay:
+            success = await self._send_relay_alert(message)
+            if success:
+                logger.info("Reminder delivered via Relay", job_id=event.job_id)
+                return
+            logger.warning("Relay delivery failed, falling back to Telegram")
+
+        # Telegram delivery (default or fallback)
         header = "🔔 <b>Reminder</b>\n\n"
         await self._broadcast_response(
             event.target_chat_ids,
             header + message,
             event.id,
         )
-        logger.info("Reminder delivered", job_id=event.job_id)
+        logger.info("Reminder delivered via Telegram", job_id=event.job_id)
         # Auto-deactivation happens in scheduler._fire_reminder()
+
+    async def _send_relay_alert(self, message: str) -> bool:
+        """POST to Relay API to send a phone alert. Returns True on success."""
+        import json as _json
+        from pathlib import Path as _Path
+
+        import httpx
+
+        creds_path = _Path(__file__).resolve().parent.parent.parent / "data" / "relay_credentials.json"
+        if not creds_path.exists():
+            logger.warning("Relay credentials not found", path=str(creds_path))
+            return False
+        try:
+            creds = _json.loads(creds_path.read_text())
+            async with httpx.AsyncClient() as client:
+                r = await client.post(
+                    f"{creds['base_url']}/execute",
+                    headers={"Authorization": f"Bearer {creds['api_key']}"},
+                    json={
+                        "service": "alerts",
+                        "action": "send",
+                        "params": {
+                            "message": f"🔔 Reminder: {message}",
+                            "title": "Phobos Reminder",
+                            "priority": "normal",
+                        },
+                    },
+                    timeout=10,
+                )
+                return r.status_code == 200
+        except Exception as e:
+            logger.warning("Relay alert failed", error=str(e))
+            return False
 
     def _fire_memory_sync(self) -> None:
         """Fire-and-forget memory sync and reminder processing after Claude response."""
