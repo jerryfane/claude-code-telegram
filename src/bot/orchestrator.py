@@ -422,6 +422,8 @@ class MessageOrchestrator:
                 BotCommand("repo", "List repos / switch workspace"),
                 BotCommand("restart", "Restart the bot"),
                 BotCommand("cron", "Manage scheduled jobs"),
+                BotCommand("moltbook", "Moltbook post performance stats"),
+                BotCommand("code", "Spawn a Claude Code sub-agent"),
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
