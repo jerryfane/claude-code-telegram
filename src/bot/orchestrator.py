@@ -2475,37 +2475,34 @@ class MessageOrchestrator:
                     elif block.get("type") == "text":
                         t = block.get("text", "").strip()
                         if t:
-                            # Keep last reasoning snippet
-                            activity_log.append(t[:200])
+                            activity_log.append(t[:300])
 
             elif msg_type == "result":
-                # Final result — always send as a new message
+                # Final result — send full text in chunks
                 cost = data.get("total_cost_usd", 0)
                 turns = data.get("num_turns", 0)
-                result = data.get("result", "")[:1500]
+                result = data.get("result", "")
                 is_error = data.get("is_error", False)
                 icon = "❌" if is_error else "✅"
-                result_text = (
-                    f"{icon} <b>Done</b> — ${cost:.4f}, {turns} turns\n\n"
-                    f"{escape_html(result)}"
-                )
+                header = f"{icon} <b>Done</b> — ${cost:.4f}, {turns} turns\n\n"
+
+                msg_kwargs: dict = {}
+                if message_thread_id:
+                    msg_kwargs["message_thread_id"] = message_thread_id
+
+                # Send result in 4000-char chunks
+                full_text = header + escape_html(result)
                 try:
-                    msg_kwargs: dict = {"parse_mode": "HTML"}
-                    if message_thread_id:
-                        msg_kwargs["message_thread_id"] = message_thread_id
-                    await chat.send_message(result_text[:4000], **msg_kwargs)
+                    for i in range(0, len(full_text), 4000):
+                        chunk = full_text[i : i + 4000]
+                        parse = "HTML" if i == 0 else None
+                        await chat.send_message(chunk, parse_mode=parse, **msg_kwargs)
+                        if i + 4000 < len(full_text):
+                            await asyncio.sleep(0.5)
                 except Exception:
                     logger.debug("Failed to send code agent result")
 
-                # Close forum topic on completion
-                if message_thread_id:
-                    try:
-                        await bot.close_forum_topic(
-                            chat_id=chat_id,
-                            message_thread_id=message_thread_id,
-                        )
-                    except Exception:
-                        logger.debug("Failed to close forum topic")
+                # Don't auto-close topic — let Jerry review and close manually
                 return
 
             elif msg_type == "system" and sub == "timeout":
@@ -2514,23 +2511,38 @@ class MessageOrchestrator:
             else:
                 return
 
-            # Update the live status message (edit, not new message)
+            # --- Delivery: forum = separate messages, private = self-edit ---
             now = _time.time()
             if now - last_edit_time[0] < 2.0:
-                return  # Throttle edits
+                return  # Throttle
             last_edit_time[0] = now
 
-            # Build rolling status from last N activity lines
-            recent = activity_log[-15:]
-            status_text = (
-                f"🤖 <b>Code Agent</b> ({mode_label} mode)\n"
-                f"Task: {escape_html(task[:100])}\n\n"
-                + "\n".join(recent[-10:])
-            )
-            try:
-                await initial_msg.edit_text(status_text[:4000], parse_mode="HTML")
-            except Exception:
-                pass  # Edit may fail if content unchanged
+            if is_forum and message_thread_id:
+                # Forum: send each update as a separate message in the topic
+                recent_lines = activity_log[-3:]
+                text = "\n".join(recent_lines)
+                if text.strip():
+                    try:
+                        await chat.send_message(
+                            text[:4000],
+                            message_thread_id=message_thread_id,
+                        )
+                    except Exception:
+                        pass
+            else:
+                # Private: self-edit the status message
+                recent = activity_log[-10:]
+                status_text = (
+                    f"🤖 <b>Code Agent</b> ({mode_label} mode)\n"
+                    f"Task: {escape_html(task[:100])}\n\n"
+                    + "\n".join(recent)
+                )
+                try:
+                    await initial_msg.edit_text(
+                        status_text[:4000], parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
 
         # Spawn the session
         try:
