@@ -152,6 +152,11 @@ def _normalize(text: str) -> str:
     cleaned = re.sub(r"(?<=\d)\s*-\s*(?=\d)", " minus ", cleaned)
     cleaned = re.sub(r"(?<=\d)\s*\*\s*(?=\d)", " times ", cleaned)
     cleaned = re.sub(r"(?<=\d)\s*/\s*(?=\d)", " divided ", cleaned)
+    # Also preserve standalone operators between words (e.g. "twenty * fifteen")
+    cleaned = re.sub(r"\s\+\s", " plus ", cleaned)
+    cleaned = re.sub(r"\s-\s", " minus ", cleaned)
+    cleaned = re.sub(r"\s\*\s", " times ", cleaned)
+    cleaned = re.sub(r"\s/\s", " divided ", cleaned)
     # Keep only letters, digits, and spaces
     cleaned = re.sub(r"[^a-zA-Z0-9 ]", "", cleaned)
     # Collapse multiple spaces and lowercase
@@ -196,10 +201,10 @@ def _dedup_chars(word: str) -> Optional[str]:
     # Strategy: try removing chars that appear consecutively OR that create a
     # known word when removed from the end (suffix trimming).
 
-    # 1. Consecutive-char dedup (safe, handles "fiveee" -> "five")
+    # 1. Consecutive-char dedup (safe, handles "fiveee" -> "five", "foouurrtteeen" -> "fourteen")
     candidates = {word}
     seen: set[str] = {word}
-    for _ in range(4):
+    for _ in range(8):
         next_candidates: set[str] = set()
         for candidate in candidates:
             for j in range(len(candidate) - 1):
@@ -358,9 +363,9 @@ def _filter_descriptor_numbers(numbers: list[float], text: str) -> list[float]:
     -> "one" is followed by "claw" (descriptor noun), so exclude 1.0
     -> returns [23.0, 17.0]
 
-    Only applies when >2 candidates — challenges always need exactly 2 operands.
+    Also handles "one claw exerts thirty five" with exactly 2 numbers.
     """
-    if len(numbers) <= 2:
+    if len(numbers) < 2:
         return numbers
 
     words = text.lower().split()
@@ -439,8 +444,8 @@ def solve_verification(challenge_text: str) -> Optional[str]:
             if parsed is not None and parsed not in numbers:
                 numbers.append(parsed)
 
-    # Filter out descriptor numbers ("one claw", "two hands") when >2 candidates
-    if len(numbers) > 2:
+    # Filter out descriptor numbers ("one claw", "two hands")
+    if len(numbers) >= 2:
         numbers = _filter_descriptor_numbers(numbers, cleaned)
         _log(f"After descriptor filter: {numbers}")
 
@@ -631,6 +636,10 @@ class MoltbookAPI:
         """POST /notifications/read-by-post/{id} - Mark notifications for a post read."""
         return await self._post(f"/notifications/read-by-post/{post_id}")
 
+    async def follow_agent(self, agent_name: str) -> dict[str, Any]:
+        """POST /agents/{name}/follow - Follow an agent by name."""
+        return await self._post(f"/agents/{agent_name}/follow", {})
+
 
 # ── CLI interface ────────────────────────────────────────────────────────
 
@@ -695,6 +704,12 @@ async def cmd_stats(args: argparse.Namespace) -> None:
     print(json.dumps(result, indent=2))
 
 
+async def cmd_follow(args: argparse.Namespace) -> None:
+    api = _get_api(args)
+    result = await api.follow_agent(args.agent_name)
+    print(json.dumps(result, indent=2))
+
+
 async def cmd_verify(args: argparse.Namespace) -> None:
     """Debug the verification solver."""
     answer = solve_verification(args.challenge)
@@ -753,6 +768,10 @@ def main() -> None:
     p_mark = sub.add_parser("mark-read", help="Mark notifications read")
     p_mark.add_argument("--post", help="Mark only for specific post ID")
 
+    # follow
+    p_follow = sub.add_parser("follow", help="Follow an agent")
+    p_follow.add_argument("agent_name", help="Agent name to follow")
+
     # stats
     sub.add_parser("stats", help="Agent profile stats")
 
@@ -770,6 +789,7 @@ def main() -> None:
         "post": cmd_post,
         "upvote": cmd_upvote,
         "mark-read": cmd_mark_read,
+        "follow": cmd_follow,
         "stats": cmd_stats,
         "verify": cmd_verify,
     }
