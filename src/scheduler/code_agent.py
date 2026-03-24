@@ -240,6 +240,8 @@ class CodeAgentSession:
 class CodeAgentService:
     """Manages active code agent sessions. One session per chat."""
 
+    PENDING_FILE = Path(__file__).resolve().parent.parent.parent / "data" / "pending_code_tasks.json"
+
     def __init__(
         self,
         working_directory: Path,
@@ -252,6 +254,12 @@ class CodeAgentService:
         self.max_budget = max_budget
         self.max_duration = max_duration
         self.active_sessions: Dict[int, CodeAgentSession] = {}
+        self._bot: Any = None  # Telegram Bot instance, set via set_bot()
+        self._is_forum: Dict[int, bool] = {}  # chat_id -> is_forum
+
+    def set_bot(self, bot: Any) -> None:
+        """Store Telegram bot reference for spawning tasks from pending file."""
+        self._bot = bot
 
     async def spawn(
         self,
@@ -295,4 +303,169 @@ class CodeAgentService:
         if session and session.status == "running":
             await session.kill()
             return True
+
+    async def process_pending_tasks(self) -> int:
+        """Pick up pending code tasks written by scripts/code_task.py.
+
+        Called as fire-and-forget after each Claude response.
+        Returns count of tasks spawned.
+        """
+        if not self._bot or not self.PENDING_FILE.exists():
+            return 0
+
+        try:
+            pending = json.loads(self.PENDING_FILE.read_text())
+        except Exception:
+            return 0
+
+        if not pending:
+            return 0
+
+        spawned = 0
+        for task_info in pending:
+            try:
+                chat_id = task_info.get("chat_id", 0)
+                task = task_info.get("task", "")
+                mode = task_info.get("mode", "build")
+
+                if not chat_id or not task:
+                    continue
+
+                # Skip if session already running for this chat
+                if self.get_session(chat_id):
+                    logger.warning("Code agent already running for chat", chat_id=chat_id)
+                    continue
+
+                permission_mode = "acceptEdits" if mode == "build" else "plan"
+
+                # Try to create forum topic
+                message_thread_id = None
+                try:
+                    chat = await self._bot.get_chat(chat_id)
+                    if getattr(chat, "is_forum", False):
+                        topic = await self._bot.create_forum_topic(
+                            chat_id=chat_id,
+                            name=f"🤖 Code: {task[:40]}",
+                        )
+                        message_thread_id = topic.message_thread_id
+                except Exception:
+                    logger.debug("Could not create forum topic for pending task")
+
+                # Send initial message
+                mode_label = "build" if permission_mode == "acceptEdits" else "plan"
+                send_kwargs: Dict[str, Any] = {"parse_mode": "HTML"}
+                if message_thread_id:
+                    send_kwargs["message_thread_id"] = message_thread_id
+
+                initial_msg = await self._bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🤖 <b>Code Agent</b> ({mode_label} mode)\n"
+                        f"Task: {task[:200]}\n\n"
+                        f"<i>Spawned by Phobos. Reply to steer. /code kill to stop.</i>"
+                    ),
+                    **send_kwargs,
+                )
+
+                # Build output callback
+                import time as _time
+                activity_log: list = []
+                last_edit_time = [0.0]
+                bot = self._bot
+
+                async def _make_callback(
+                    _chat_id: int, _thread_id: Optional[int],
+                    _initial_msg: Any, _activity: list, _last_edit: list,
+                    _mode_label: str, _task: str,
+                ) -> Callable:
+                    async def _cb(data: dict) -> None:
+                        msg_type = data.get("type", "")
+
+                        if msg_type == "assistant":
+                            for block in data.get("message", {}).get("content", []):
+                                if block.get("type") == "tool_use":
+                                    name = block.get("name", "?")
+                                    inp = block.get("input", {})
+                                    if name == "Bash":
+                                        _activity.append(f"⚡ Bash: {inp.get('command','?')[:80]}")
+                                    elif name in ("Read", "Edit", "Write", "Glob", "Grep"):
+                                        _activity.append(f"🔧 {name} {inp.get('file_path', inp.get('pattern','?'))[:60]}")
+                                    else:
+                                        _activity.append(f"🔧 {name}")
+                                elif block.get("type") == "text":
+                                    t = block.get("text", "").strip()
+                                    if t:
+                                        _activity.append(t[:300])
+
+                        elif msg_type == "result":
+                            result = data.get("result", "")
+                            cost = data.get("total_cost_usd", 0)
+                            turns = data.get("num_turns", 0)
+                            is_error = data.get("is_error", False)
+                            icon = "❌" if is_error else "✅"
+                            header = f"{icon} <b>Done</b> — ${cost:.4f}, {turns} turns\n\n"
+                            full = header + result
+                            kw: Dict[str, Any] = {}
+                            if _thread_id:
+                                kw["message_thread_id"] = _thread_id
+                            for i in range(0, len(full), 4000):
+                                chunk = full[i:i+4000]
+                                parse = "HTML" if i == 0 else None
+                                try:
+                                    await bot.send_message(chat_id=_chat_id, text=chunk, parse_mode=parse, **kw)
+                                except Exception:
+                                    pass
+                            return
+
+                        else:
+                            return
+
+                        now = _time.time()
+                        if now - _last_edit[0] < 2.0:
+                            return
+                        _last_edit[0] = now
+
+                        if _thread_id:
+                            recent = _activity[-3:]
+                            text = "\n".join(recent)
+                            if text.strip():
+                                try:
+                                    await bot.send_message(chat_id=_chat_id, text=text[:4000], message_thread_id=_thread_id)
+                                except Exception:
+                                    pass
+                        else:
+                            recent = _activity[-10:]
+                            status = f"🤖 <b>Code Agent</b> ({_mode_label})\nTask: {_task[:100]}\n\n" + "\n".join(recent)
+                            try:
+                                await bot.edit_message_text(text=status[:4000], chat_id=_chat_id, message_id=_initial_msg.message_id, parse_mode="HTML")
+                            except Exception:
+                                pass
+
+                    return _cb
+
+                callback = await _make_callback(
+                    chat_id, message_thread_id, initial_msg,
+                    activity_log, last_edit_time, mode_label, task,
+                )
+
+                session = await self.spawn(
+                    task=task,
+                    chat_id=chat_id,
+                    output_callback=callback,
+                    permission_mode=permission_mode,
+                )
+                session.message_thread_id = message_thread_id
+                spawned += 1
+                logger.info("Spawned code agent from pending task", task=task[:60], chat_id=chat_id)
+
+            except Exception:
+                logger.exception("Failed to process pending code task")
+
+        # Clear pending file
+        try:
+            self.PENDING_FILE.write_text("[]\n")
+        except Exception:
+            pass
+
+        return spawned
         return False

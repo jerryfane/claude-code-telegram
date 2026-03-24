@@ -1033,6 +1033,9 @@ class MessageOrchestrator:
             reminder_svc = context.bot_data.get("reminder_service")
             if reminder_svc:
                 asyncio.create_task(reminder_svc.process_pending())
+            code_svc = context.bot_data.get("code_agent_service")
+            if code_svc:
+                asyncio.create_task(code_svc.process_pending_tasks())
 
             # New session created successfully — clear the one-shot flag
             if force_new:
@@ -1324,6 +1327,9 @@ class MessageOrchestrator:
             reminder_svc = context.bot_data.get("reminder_service")
             if reminder_svc:
                 asyncio.create_task(reminder_svc.process_pending())
+            code_svc = context.bot_data.get("code_agent_service")
+            if code_svc:
+                asyncio.create_task(code_svc.process_pending_tasks())
 
             if force_new:
                 context.user_data["force_new_session"] = False
@@ -1586,6 +1592,9 @@ class MessageOrchestrator:
         reminder_svc = context.bot_data.get("reminder_service")
         if reminder_svc:
             asyncio.create_task(reminder_svc.process_pending())
+        code_svc = context.bot_data.get("code_agent_service")
+        if code_svc:
+            asyncio.create_task(code_svc.process_pending_tasks())
 
         if force_new:
             context.user_data["force_new_session"] = False

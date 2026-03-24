@@ -337,6 +337,10 @@ async def run_application(app: Dict[str, Any]) -> None:
         # Now wire up components that need the Telegram Bot instance
         telegram_bot = bot.app.bot
 
+        # Wire bot reference to CodeAgentService for pending task pickup
+        code_agent_service: CodeAgentService = bot.deps["code_agent_service"]
+        code_agent_service.set_bot(telegram_bot)
+
         # Start event bus
         await event_bus.start()
 
