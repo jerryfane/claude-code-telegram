@@ -70,6 +70,14 @@ class CodeAgentSession:
             f"- If you hit an error, try to fix it. After 2 failed attempts, report and stop.\n"
         )
 
+        if self.permission_mode == "acceptEdits":
+            system_prompt += (
+                f"\nIMPORTANT: You have full edit permissions. "
+                f"Do NOT enter plan mode. Do NOT call EnterPlanMode or ExitPlanMode. "
+                f"Read what you need, then make the changes directly. "
+                f"This is a single-turn execution — plan internally, act immediately.\n"
+            )
+
         cmd = [
             self.cli_path,
             "-p",
