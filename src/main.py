@@ -25,6 +25,7 @@ from src.events.middleware import EventSecurityMiddleware
 from src.exceptions import ConfigurationError
 from src.notifications.service import NotificationService
 from src.projects import ProjectThreadManager, load_project_registry
+from src.scheduler.code_agent import CodeAgentService
 from src.scheduler.heartbeat import HeartbeatService
 from src.scheduler.memory_sync import MemorySyncService
 from src.scheduler.moltbook_notify import MoltbookNotifyService
@@ -188,6 +189,12 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         working_directory=config.approved_directory,
     )
 
+    # Code agent service — spawns claude CLI sub-agents
+    code_agent_service = CodeAgentService(
+        working_directory=config.approved_directory,
+        cli_path=str(config.claude_cli_path) if config.claude_cli_path else "/home/pi/.local/bin/claude",
+    )
+
     # Memory sync service — event-driven push after Claude writes
     memory_sync_service: Optional[MemorySyncService] = None
     if config.resolved_memory_dir:
@@ -227,6 +234,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     bot = ClaudeCodeBot(config, dependencies)
 
     # Services available to all handlers (not just scheduler)
+    bot.deps["code_agent_service"] = code_agent_service
     bot.deps["moltbook_stats_service"] = moltbook_stats_service
     bot.deps["moltbook_notify_service"] = moltbook_notify_service
     if memory_sync_service:

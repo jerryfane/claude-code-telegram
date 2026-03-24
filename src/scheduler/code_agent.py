@@ -1,0 +1,280 @@
+"""Code agent service — spawns real claude CLI subprocesses for delegated coding.
+
+Phobos or Jerry triggers /code, which launches a claude CLI process with
+stream-json I/O. Output streams to a Telegram reply thread in real-time.
+Jerry can reply in the thread to steer the sub-agent, or /code kill to stop it.
+"""
+
+import asyncio
+import json
+import uuid
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, Callable, Coroutine, Dict, Optional
+
+import structlog
+
+logger = structlog.get_logger()
+
+# Defaults
+DEFAULT_MAX_BUDGET = 0.50  # USD per invocation
+DEFAULT_MAX_DURATION = 300  # seconds
+DEFAULT_CLI_PATH = "/home/pi/.local/bin/claude"
+
+
+class CodeAgentSession:
+    """A running claude CLI subprocess with bidirectional JSON streaming."""
+
+    def __init__(
+        self,
+        task: str,
+        working_directory: Path,
+        cli_path: str,
+        output_callback: Callable[[Dict[str, Any]], Coroutine],
+        permission_mode: str = "plan",
+        max_budget: float = DEFAULT_MAX_BUDGET,
+        max_duration: int = DEFAULT_MAX_DURATION,
+        model: Optional[str] = None,
+    ) -> None:
+        self.task = task
+        self.working_directory = working_directory
+        self.cli_path = cli_path
+        self.output_callback = output_callback
+        self.permission_mode = permission_mode
+        self.max_budget = max_budget
+        self.max_duration = max_duration
+        self.model = model
+
+        self.session_id = str(uuid.uuid4())
+        self.started_at: Optional[datetime] = None
+        self.finished_at: Optional[datetime] = None
+        self.status = "pending"  # pending, running, completed, killed, failed
+        self.total_cost: float = 0
+        self.num_turns: int = 0
+        self.result_text: str = ""
+
+        self._process: Optional[asyncio.subprocess.Process] = None
+        self._read_task: Optional[asyncio.Task] = None
+        self._timeout_task: Optional[asyncio.Task] = None
+
+    async def start(self) -> None:
+        """Spawn the claude CLI with stream-json I/O."""
+        system_prompt = (
+            f"You are a code agent spawned to execute a specific task.\n"
+            f"Your task: {self.task}\n\n"
+            f"Constraints:\n"
+            f"- All file operations must stay within {self.working_directory}\n"
+            f"- Complete the task, then stop. Do not ask for clarification.\n"
+            f"- Be concise in your reasoning. The orchestrator is watching.\n"
+            f"- If you hit an error, try to fix it. After 2 failed attempts, report and stop.\n"
+        )
+
+        cmd = [
+            self.cli_path,
+            "-p",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--permission-mode", self.permission_mode,
+            "--max-budget-usd", str(self.max_budget),
+            "--system-prompt", system_prompt,
+            "--setting-sources", "",
+            self.task,
+        ]
+
+        if self.model:
+            cmd.extend(["--model", self.model])
+
+        logger.info(
+            "Spawning code agent",
+            session_id=self.session_id,
+            task=self.task[:80],
+            mode=self.permission_mode,
+            budget=self.max_budget,
+        )
+
+        self._process = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(self.working_directory),
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        self.started_at = datetime.now(UTC)
+        self.status = "running"
+
+        # Start background readers
+        self._read_task = asyncio.create_task(self._read_output_loop())
+        self._timeout_task = asyncio.create_task(self._timeout_watchdog())
+
+    async def send_message(self, text: str) -> bool:
+        """Send a steering message to the sub-agent via stdin (stream-json format)."""
+        if not self._process or self._process.stdin is None:
+            return False
+        if self.status != "running":
+            return False
+
+        msg = json.dumps({"type": "user", "content": text}) + "\n"
+        try:
+            self._process.stdin.write(msg.encode())
+            await self._process.stdin.drain()
+            logger.info("Sent steering message to code agent", text=text[:80])
+            return True
+        except Exception as e:
+            logger.warning("Failed to send to code agent stdin", error=str(e))
+            return False
+
+    async def kill(self) -> None:
+        """Terminate the subprocess."""
+        if self._process and self.status == "running":
+            self.status = "killed"
+            self.finished_at = datetime.now(UTC)
+            try:
+                self._process.terminate()
+                await asyncio.wait_for(self._process.wait(), timeout=5)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                try:
+                    self._process.kill()
+                except ProcessLookupError:
+                    pass
+            logger.info("Code agent killed", session_id=self.session_id)
+
+        if self._read_task and not self._read_task.done():
+            self._read_task.cancel()
+        if self._timeout_task and not self._timeout_task.done():
+            self._timeout_task.cancel()
+
+    async def _read_output_loop(self) -> None:
+        """Read stream-json lines from stdout and forward to callback."""
+        assert self._process and self._process.stdout
+
+        try:
+            while True:
+                line = await self._process.stdout.readline()
+                if not line:
+                    break  # EOF — process exited
+
+                line_str = line.decode().strip()
+                if not line_str:
+                    continue
+
+                try:
+                    data = json.loads(line_str)
+                except json.JSONDecodeError:
+                    continue
+
+                msg_type = data.get("type", "")
+
+                # Extract result info
+                if msg_type == "result":
+                    self.total_cost = data.get("total_cost_usd", 0)
+                    self.num_turns = data.get("num_turns", 0)
+                    self.result_text = data.get("result", "")[:2000]
+                    self.status = "completed"
+                    self.finished_at = datetime.now(UTC)
+
+                # Forward to callback (Telegram delivery)
+                try:
+                    await self.output_callback(data)
+                except Exception:
+                    logger.debug("Output callback error", exc_info=True)
+
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Code agent output reader failed")
+        finally:
+            # Ensure status is set
+            if self.status == "running":
+                self.status = "completed"
+                self.finished_at = datetime.now(UTC)
+            if self._timeout_task and not self._timeout_task.done():
+                self._timeout_task.cancel()
+
+    async def _timeout_watchdog(self) -> None:
+        """Kill the process if it exceeds max duration."""
+        try:
+            await asyncio.sleep(self.max_duration)
+            if self.status == "running":
+                logger.warning(
+                    "Code agent timed out",
+                    session_id=self.session_id,
+                    max_duration=self.max_duration,
+                )
+                self.status = "failed"
+                await self.output_callback({
+                    "type": "system",
+                    "subtype": "timeout",
+                    "message": f"Code agent timed out after {self.max_duration}s",
+                })
+                await self.kill()
+        except asyncio.CancelledError:
+            pass
+
+    @property
+    def duration_seconds(self) -> float:
+        if not self.started_at:
+            return 0
+        end = self.finished_at or datetime.now(UTC)
+        return (end - self.started_at).total_seconds()
+
+
+class CodeAgentService:
+    """Manages active code agent sessions. One session per chat."""
+
+    def __init__(
+        self,
+        working_directory: Path,
+        cli_path: str = DEFAULT_CLI_PATH,
+        max_budget: float = DEFAULT_MAX_BUDGET,
+        max_duration: int = DEFAULT_MAX_DURATION,
+    ) -> None:
+        self.working_directory = working_directory
+        self.cli_path = cli_path
+        self.max_budget = max_budget
+        self.max_duration = max_duration
+        self.active_sessions: Dict[int, CodeAgentSession] = {}
+
+    async def spawn(
+        self,
+        task: str,
+        chat_id: int,
+        output_callback: Callable[[Dict[str, Any]], Coroutine],
+        permission_mode: str = "plan",
+        model: Optional[str] = None,
+    ) -> CodeAgentSession:
+        """Create and start a new code agent session."""
+        # Kill any existing session for this chat
+        if chat_id in self.active_sessions:
+            old = self.active_sessions[chat_id]
+            if old.status == "running":
+                await old.kill()
+
+        session = CodeAgentSession(
+            task=task,
+            working_directory=self.working_directory,
+            cli_path=self.cli_path,
+            output_callback=output_callback,
+            permission_mode=permission_mode,
+            max_budget=self.max_budget,
+            max_duration=self.max_duration,
+            model=model,
+        )
+        self.active_sessions[chat_id] = session
+        await session.start()
+        return session
+
+    def get_session(self, chat_id: int) -> Optional[CodeAgentSession]:
+        """Get the active session for a chat."""
+        session = self.active_sessions.get(chat_id)
+        if session and session.status == "running":
+            return session
+        return None
+
+    async def kill_session(self, chat_id: int) -> bool:
+        """Kill the active session for a chat."""
+        session = self.active_sessions.get(chat_id)
+        if session and session.status == "running":
+            await session.kill()
+            return True
+        return False

@@ -311,6 +311,7 @@ class MessageOrchestrator:
             ("restart", command.restart_command),
             ("cron", self.agentic_cron),
             ("moltbook", self.agentic_moltbook),
+            ("code", self.agentic_code),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -870,6 +871,33 @@ class MessageOrchestrator:
         """Direct Claude passthrough. Simple progress. No suggestions."""
         user_id = update.effective_user.id
         message_text = update.message.text
+
+        # Intercept replies to code agent threads — steer the sub-agent
+        if update.message.reply_to_message:
+            chat_id = update.effective_chat.id
+            thread_key = f"_code_agent_thread_{chat_id}"
+            thread_msg_id = context.bot_data.get(thread_key)
+            reply_to_id = update.message.reply_to_message.message_id
+
+            if thread_msg_id and reply_to_id:
+                from ..scheduler.code_agent import CodeAgentService
+
+                svc: Optional["CodeAgentService"] = context.bot_data.get("code_agent_service")
+                if svc:
+                    session = svc.get_session(chat_id)
+                    if session and session.status == "running":
+                        # Check for kill commands
+                        lower = message_text.strip().lower()
+                        if lower in ("stop", "kill", "abort"):
+                            await svc.kill_session(chat_id)
+                            await update.message.reply_text("Code agent terminated.")
+                            return
+
+                        # Send as steering input
+                        sent = await session.send_message(message_text)
+                        if sent:
+                            await update.message.reply_text("↪️ Sent to code agent.")
+                            return
 
         # Prepend quoted message context when replying to a previous message
         reply_context = extract_reply_context(update.message)
@@ -2190,6 +2218,182 @@ class MessageOrchestrator:
             header + result.build_summary(),
             parse_mode="HTML",
         )
+
+    async def agentic_code(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle /code command — spawn a claude CLI sub-agent."""
+        if not update.message or not update.effective_user:
+            return
+
+        from ..scheduler.code_agent import CodeAgentService
+
+        svc: Optional[CodeAgentService] = context.bot_data.get("code_agent_service")
+        if not svc:
+            await update.message.reply_text("CodeAgentService is not available.")
+            return
+
+        args = context.args or []
+        if not args:
+            await update.message.reply_text(
+                "<b>Usage:</b>\n"
+                '<code>/code &lt;task&gt;</code> — spawn sub-agent (plan mode)\n'
+                '<code>/code --build &lt;task&gt;</code> — spawn sub-agent (can edit files)\n'
+                "<code>/code status</code> — show active session\n"
+                "<code>/code kill</code> — terminate active session",
+                parse_mode="HTML",
+            )
+            return
+
+        chat_id = update.effective_chat.id
+        subcmd = args[0].lower()
+
+        # /code kill
+        if subcmd == "kill":
+            killed = await svc.kill_session(chat_id)
+            if killed:
+                await update.message.reply_text("Code agent terminated.")
+            else:
+                await update.message.reply_text("No active code agent session.")
+            return
+
+        # /code status
+        if subcmd == "status":
+            session = svc.get_session(chat_id)
+            if session:
+                elapsed = int(session.duration_seconds)
+                await update.message.reply_text(
+                    f"🤖 <b>Code Agent Active</b>\n"
+                    f"Task: {escape_html(session.task[:100])}\n"
+                    f"Mode: {session.permission_mode}\n"
+                    f"Running: {elapsed}s\n"
+                    f"Cost: ${session.total_cost:.4f}\n"
+                    f"Turns: {session.num_turns}",
+                    parse_mode="HTML",
+                )
+            else:
+                await update.message.reply_text("No active code agent session.")
+            return
+
+        # /code --build <task> or /code <task>
+        permission_mode = "plan"
+        task_args = args
+        if args[0] == "--build":
+            permission_mode = "acceptEdits"
+            task_args = args[1:]
+
+        task = " ".join(task_args)
+        if not task:
+            await update.message.reply_text("Please provide a task description.")
+            return
+
+        # Check for existing session
+        existing = svc.get_session(chat_id)
+        if existing:
+            await update.message.reply_text(
+                "A code agent is already running. Use /code kill first."
+            )
+            return
+
+        # Send initial message — replies to this create the thread
+        mode_label = "build" if permission_mode == "acceptEdits" else "plan"
+        initial_msg = await update.message.reply_text(
+            f"🤖 <b>Code Agent</b> ({mode_label} mode)\n"
+            f"Task: {escape_html(task[:200])}\n\n"
+            f"<i>Streaming output below. Reply to steer. /code kill to stop.</i>",
+            parse_mode="HTML",
+        )
+
+        # Track the thread message ID for reply detection
+        thread_key = f"_code_agent_thread_{chat_id}"
+        context.bot_data[thread_key] = initial_msg.message_id
+
+        # Build output callback that sends to Telegram as replies
+        chat = update.effective_chat
+        msg_buffer: list[str] = []
+        last_send_time: list[float] = [0]  # Mutable for closure
+
+        async def _output_callback(data: dict) -> None:
+            msg_type = data.get("type", "")
+            sub = data.get("subtype", "")
+            text = ""
+
+            if msg_type == "assistant":
+                msg_obj = data.get("message", {})
+                for block in msg_obj.get("content", []):
+                    if block.get("type") == "text":
+                        t = block["text"]
+                        if t.strip():
+                            text = t[:500]
+                    elif block.get("type") == "tool_use":
+                        name = block.get("name", "?")
+                        inp = block.get("input", {})
+                        # Format tool calls nicely
+                        if name == "Read":
+                            text = f"🔧 Read {inp.get('file_path', '?')}"
+                        elif name == "Edit":
+                            text = f"✏️ Edit {inp.get('file_path', '?')}"
+                        elif name == "Write":
+                            text = f"📝 Write {inp.get('file_path', '?')}"
+                        elif name == "Bash":
+                            cmd = inp.get("command", "?")[:100]
+                            text = f"⚡ Bash: {cmd}"
+                        elif name in ("Glob", "Grep"):
+                            pattern = inp.get("pattern", "?")[:80]
+                            text = f"🔍 {name}: {pattern}"
+                        else:
+                            text = f"🔧 {name}"
+
+            elif msg_type == "result":
+                cost = data.get("total_cost_usd", 0)
+                turns = data.get("num_turns", 0)
+                result = data.get("result", "")[:500]
+                is_error = data.get("is_error", False)
+                icon = "❌" if is_error else "✅"
+                text = (
+                    f"{icon} <b>Done</b> — "
+                    f"${cost:.4f}, {turns} turns\n\n{escape_html(result)}"
+                )
+
+            elif msg_type == "system" and sub == "timeout":
+                text = f"⏱️ {data.get('message', 'Timed out')}"
+
+            if not text:
+                return
+
+            # Throttle: don't send more than 1 msg per 1.5s
+            import time
+            now = time.time()
+            if now - last_send_time[0] < 1.5 and msg_type != "result":
+                msg_buffer.append(text)
+                return
+            last_send_time[0] = now
+
+            # Flush buffer
+            if msg_buffer:
+                text = "\n".join(msg_buffer) + "\n" + text
+                msg_buffer.clear()
+
+            try:
+                parse = "HTML" if msg_type == "result" else None
+                await chat.send_message(
+                    text[:4000],
+                    reply_to_message_id=initial_msg.message_id,
+                    parse_mode=parse,
+                )
+            except Exception:
+                logger.debug("Failed to send code agent output to Telegram")
+
+        # Spawn the session
+        try:
+            await svc.spawn(
+                task=task,
+                chat_id=chat_id,
+                output_callback=_output_callback,
+                permission_mode=permission_mode,
+            )
+        except Exception as e:
+            await update.message.reply_text(f"Failed to spawn code agent: {e}")
 
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
