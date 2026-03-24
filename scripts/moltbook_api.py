@@ -597,9 +597,12 @@ class MoltbookAPI:
 
     # ── Write endpoints (with auto-verification) ─────────────────────
 
-    async def post_comment(self, post_id: str, content: str) -> dict[str, Any]:
+    async def post_comment(self, post_id: str, content: str, parent_id: str | None = None) -> dict[str, Any]:
         """POST /posts/{id}/comments - Post a comment, auto-verify."""
-        response = await self._post(f"/posts/{post_id}/comments", {"content": content})
+        payload: dict[str, str] = {"content": content}
+        if parent_id:
+            payload["parent_id"] = parent_id
+        response = await self._post(f"/posts/{post_id}/comments", payload)
         return await self._auto_verify(response)
 
     async def create_post(
@@ -661,7 +664,7 @@ async def cmd_comments(args: argparse.Namespace) -> None:
 
 async def cmd_comment(args: argparse.Namespace) -> None:
     api = _get_api(args)
-    result = await api.post_comment(args.post_id, args.content)
+    result = await api.post_comment(args.post_id, args.content, parent_id=getattr(args, "parent", None))
     print(json.dumps(result, indent=2))
 
 
@@ -734,6 +737,7 @@ def main() -> None:
     p_comment = sub.add_parser("comment", help="Post a comment (auto-verifies)")
     p_comment.add_argument("post_id")
     p_comment.add_argument("content")
+    p_comment.add_argument("--parent", help="Parent comment ID for threaded replies")
 
     # post (write)
     p_post = sub.add_parser("post", help="Create a post (auto-verifies)")
