@@ -911,6 +911,40 @@ class MessageOrchestrator:
                         await update.message.reply_text("↪️ Sent to code agent.")
                         return
 
+        # In group chats, only process messages addressed to the bot
+        if update.effective_chat.type in ("group", "supergroup"):
+            is_addressed = False
+
+            # 1. @mention (e.g., @PhobosClaude_bot)
+            if update.message.entities:
+                bot_username = self.settings.telegram_bot_username.lower()
+                for entity in update.message.entities:
+                    if entity.type == "mention":
+                        mentioned = message_text[
+                            entity.offset : entity.offset + entity.length
+                        ]
+                        if mentioned.lower() == f"@{bot_username}":
+                            is_addressed = True
+                            break
+
+            # 2. Name mention (e.g., "Phobos" in text)
+            if not is_addressed and "phobos" in message_text.lower():
+                is_addressed = True
+
+            # 3. Reply to bot's own message
+            if not is_addressed and update.message.reply_to_message:
+                reply_from = update.message.reply_to_message.from_user
+                if reply_from and reply_from.is_bot:
+                    is_addressed = True
+
+            if not is_addressed:
+                return  # Ignore — not addressed to bot
+
+            # Strip @mention from the prompt so Claude gets a clean message
+            bot_tag = f"@{self.settings.telegram_bot_username}"
+            if message_text.startswith(bot_tag):
+                message_text = message_text[len(bot_tag) :].strip()
+
         # Prepend quoted message context when replying to a previous message
         reply_context = extract_reply_context(update.message)
         if reply_context:
@@ -1141,6 +1175,16 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Process file upload -> Claude, minimal chrome."""
+        # In groups, only process if replying to bot or bot is mentioned in caption
+        if update.effective_chat.type in ("group", "supergroup"):
+            caption = update.message.caption or ""
+            is_addressed = "phobos" in caption.lower()
+            if not is_addressed and update.message.reply_to_message:
+                reply_from = update.message.reply_to_message.from_user
+                is_addressed = reply_from and reply_from.is_bot
+            if not is_addressed:
+                return
+
         user_id = update.effective_user.id
         document = update.message.document
 
@@ -1359,6 +1403,16 @@ class MessageOrchestrator:
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Process photo -> Claude, minimal chrome."""
+        # In groups, only process if replying to bot or bot is mentioned in caption
+        if update.effective_chat.type in ("group", "supergroup"):
+            caption = update.message.caption or ""
+            is_addressed = "phobos" in caption.lower()
+            if not is_addressed and update.message.reply_to_message:
+                reply_from = update.message.reply_to_message.from_user
+                is_addressed = reply_from and reply_from.is_bot
+            if not is_addressed:
+                return
+
         user_id = update.effective_user.id
 
         features = context.bot_data.get("features")
