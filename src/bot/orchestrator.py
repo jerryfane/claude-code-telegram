@@ -312,6 +312,7 @@ class MessageOrchestrator:
             ("cron", self.agentic_cron),
             ("moltbook", self.agentic_moltbook),
             ("code", self.agentic_code),
+            ("help", self.agentic_help),
         ]
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
@@ -424,6 +425,7 @@ class MessageOrchestrator:
                 BotCommand("cron", "Manage scheduled jobs"),
                 BotCommand("moltbook", "Moltbook post performance stats"),
                 BotCommand("code", "Spawn a Claude Code sub-agent"),
+                BotCommand("help", "Show all commands"),
             ]
             if self.settings.enable_project_threads:
                 commands.append(BotCommand("sync_threads", "Sync project topics"))
@@ -2218,6 +2220,49 @@ class MessageOrchestrator:
         header = "📊 <b>Moltbook Performance</b>\n\n"
         await update.message.reply_text(
             header + result.build_summary(),
+            parse_mode="HTML",
+        )
+
+    async def agentic_help(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Show all available commands with usage."""
+        if not update.message:
+            return
+
+        await update.message.reply_text(
+            "<b>Commands</b>\n\n"
+            "<b>General</b>\n"
+            "/start — Start the bot\n"
+            "/new — Start a fresh Claude session\n"
+            "/status — Show session status\n"
+            "/verbose 0|1|2 — Set output verbosity\n"
+            "/repo — List repos / switch workspace\n"
+            "/restart — Restart the bot\n"
+            "/help — This message\n"
+            "\n"
+            "<b>Scheduled Jobs</b>\n"
+            "/cron — List all active jobs\n"
+            "/cron heartbeat &lt;cron&gt; — Add heartbeat job\n"
+            "/cron x_digest &lt;cron&gt; — Add X/Twitter digest job\n"
+            "/cron moltbook_stats &lt;cron&gt; — Add Moltbook stats job\n"
+            "/cron moltbook_notify &lt;cron&gt; — Add notification check job\n"
+            "/cron add &lt;cron&gt; | &lt;name&gt; | &lt;prompt&gt; — Add generic job\n"
+            "/cron remove &lt;job_id&gt; — Remove a job\n"
+            "/cron update &lt;job_id&gt; &lt;cron&gt; — Update schedule\n"
+            "/cron reload — Reload from database\n"
+            "/cron test heartbeat|x_digest|moltbook_stats|moltbook_notify — Dry-run\n"
+            "\n"
+            "<b>Moltbook</b>\n"
+            "/moltbook stats — Show post performance\n"
+            "\n"
+            "<b>Code Agent</b>\n"
+            '/code &lt;task&gt; — Spawn sub-agent (plan mode, read-only)\n'
+            "/code --build &lt;task&gt; — Spawn sub-agent (can edit files)\n"
+            "/code status — Show active session\n"
+            "/code kill — Terminate active session\n"
+            "<i>Reply to a code agent message to steer it. "
+            '"stop"/"kill"/"abort" to terminate.</i>',
             parse_mode="HTML",
         )
 
