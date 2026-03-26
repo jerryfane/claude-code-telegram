@@ -112,16 +112,23 @@ ADD_WORDS = {
 SUB_WORDS = {
     "minus", "slows", "subtracts", "loses", "decreased", "reduces",
     "drops", "decelerates", "slower", "decreases",
+    "lose", "lost",
 }
-MUL_WORDS = {"times", "product", "multiplied", "multiplies"}
+MUL_WORDS = {"times", "product", "multiplied", "multiplies", "impulse"}
 DIV_WORDS = {"divided", "over", "split", "halved"}
+
+# Physics keyword phrases that imply specific operations
+PHYSICS_PHRASES: dict[str, str] = {
+    "net force": "-",     # net force = force - resistance
+    "impulse": "*",       # impulse = force × time
+}
 
 # Multi-word operator phrases (checked before single words)
 MULTI_WORD_OPS: dict[str, list[str]] = {
     "*": ["scaled by", "multiplied by"],
     "/": ["divided by", "split by"],
-    "+": ["speeds up", "adds up", "goes up", "moves up"],
-    "-": ["slows down", "goes down", "drops by", "falls by"],
+    "+": ["speeds up", "adds up", "goes up", "moves up", "powers up"],
+    "-": ["slows down", "goes down", "drops by", "falls by", "net force"],
 }
 
 # Nouns that make a preceding number a descriptor, not an operand
@@ -130,12 +137,188 @@ DESCRIPTOR_NOUNS = {
     "claw", "claws", "hand", "hands", "arm", "arms",
     "side", "sides", "leg", "legs", "eye", "eyes",
     "wing", "wings", "fin", "fins", "tail", "tails",
-    "antenna", "antennae",
+    "antenna", "antennae", "lobster", "lobsters",
+    "shell", "shells",
 }
 
 
 def _log(msg: str) -> None:
     print(f"[moltbook_api] {msg}", file=sys.stderr, flush=True)
+
+
+# Common number-word fragments that should be merged (bug #3)
+# Maps (prefix, suffix) -> merged word for fragments that _merge_fragments
+# might miss when embedded in longer token sequences.
+_NUMBER_FRAGMENTS = {
+    ("sev", "en"): "seven",
+    ("eigh", "t"): "eight",
+    ("ni", "ne"): "nine",
+    ("el", "even"): "eleven",
+    ("twe", "lve"): "twelve",
+    ("thir", "teen"): "thirteen",
+    ("four", "teen"): "fourteen",
+    ("fif", "teen"): "fifteen",
+    ("six", "teen"): "sixteen",
+    ("seven", "teen"): "seventeen",
+    ("eigh", "teen"): "eighteen",
+    ("nine", "teen"): "nineteen",
+    ("twen", "ty"): "twenty",
+    ("thir", "ty"): "thirty",
+    ("for", "ty"): "forty",
+    ("fif", "ty"): "fifty",
+    ("six", "ty"): "sixty",
+    ("seven", "ty"): "seventy",
+    ("eigh", "ty"): "eighty",
+    ("nine", "ty"): "ninety",
+}
+
+# Non-number prefixes/suffixes that can get glued to number words (bug #4)
+_GLUE_PREFIXES = [
+    "is", "are", "was", "has", "the", "its", "our", "his", "her", "and",
+    "but", "for", "not", "get", "got", "can", "may", "had", "did", "does",
+    "force", "be", "of", "to", "at", "by", "in", "on", "or", "an", "if",
+    "so", "do", "up", "it", "my", "no", "we", "he",
+]
+_GLUE_SUFFIXES = [
+    "is", "are", "was", "has", "the", "its", "and", "but", "for", "not",
+    "can", "may", "force", "per", "by", "in", "on", "or", "of", "to",
+]
+
+# All number words for glue-splitting detection
+_ALL_NUMBER_WORDS = set(ONES.keys()) | set(TENS.keys()) | {"hundred"}
+
+# ── Bug 3 (LOW): Common misspelling/obfuscation patterns for teen numbers ─
+# Maps misspelled variants to correct number words
+_TEEN_MISSPELLINGS: dict[str, str] = {
+    "fourleen": "fourteen",
+    "forteen": "fourteen",
+    "forteeen": "fourteen",
+    "fourten": "fourteen",
+    "fiften": "fifteen",
+    "fiveteen": "fifteen",
+    "fifteeen": "fifteen",
+    "threeteen": "thirteen",
+    "thirten": "thirteen",
+    "sixten": "sixteen",
+    "seventeeen": "seventeen",
+    "eighten": "eighteen",
+    "ninteen": "nineteen",
+    "nineten": "nineteen",
+    "elevin": "eleven",
+    "twelwe": "twelve",
+    "twelf": "twelve",
+}
+
+
+def _fuzzy_match_number_word(word: str) -> Optional[str]:
+    """Fuzzy-match a mangled word against known number words.
+
+    After deobfuscation+dedup, compound number second words can get mangled:
+    'fIfEe' -> 'fife' (not 'five'), 'TrEeEe' -> 'tree' or 'treee' (not 'three').
+
+    Strategy:
+    1. Check exact match in known number words
+    2. Check teen misspelling table
+    3. Try edit-distance-1 matches against number words
+    4. Try substring containment heuristics
+    """
+    if word in _ALL_NUMBER_WORDS:
+        return word
+    if word in _TEEN_MISSPELLINGS:
+        return _TEEN_MISSPELLINGS[word]
+
+    # Build candidates from ONES and TENS keys
+    all_targets = list(ONES.keys()) + list(TENS.keys())
+
+    # Try edit distance 1 (substitution, insertion, deletion)
+    best_match: Optional[str] = None
+    best_dist = 999
+    for target in all_targets:
+        d = _edit_distance(word, target)
+        if d < best_dist:
+            best_dist = d
+            best_match = target
+
+    # Accept edit distance <= 2 for words of length >= 4, <= 1 for shorter
+    max_dist = 2 if len(word) >= 4 else 1
+    if best_dist <= max_dist and best_match:
+        return best_match
+
+    return None
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """Compute Levenshtein edit distance between two strings."""
+    if len(a) < len(b):
+        return _edit_distance(b, a)
+    if len(b) == 0:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a):
+        curr = [i + 1] + [0] * len(b)
+        for j, cb in enumerate(b):
+            cost = 0 if ca == cb else 1
+            curr[j + 1] = min(curr[j] + 1, prev[j + 1] + 1, prev[j] + cost)
+        prev = curr
+    return prev[len(b)]
+
+
+def _split_glued_words(text: str) -> str:
+    """Split words where non-number text is glued to number words (bug #4).
+
+    'isthirty two' -> 'is thirty two'
+    'forceis' -> 'force is'
+    """
+    tokens = text.split()
+    result: list[str] = []
+    for token in tokens:
+        if token in _KNOWN_WORDS or token in _ALL_NUMBER_WORDS:
+            result.append(token)
+            continue
+        split_done = False
+        # Check if token starts with a known prefix glued to a number word
+        for prefix in _GLUE_PREFIXES:
+            if token.startswith(prefix) and len(token) > len(prefix):
+                remainder = token[len(prefix):]
+                if remainder in _ALL_NUMBER_WORDS or remainder in _KNOWN_WORDS:
+                    result.append(prefix)
+                    result.append(remainder)
+                    split_done = True
+                    break
+        if split_done:
+            continue
+        # Check if token ends with a known suffix glued to a number word
+        for suffix in _GLUE_SUFFIXES:
+            if token.endswith(suffix) and len(token) > len(suffix):
+                remainder = token[:-len(suffix)]
+                if remainder in _ALL_NUMBER_WORDS or remainder in _KNOWN_WORDS:
+                    result.append(remainder)
+                    result.append(suffix)
+                    split_done = True
+                    break
+        if not split_done:
+            result.append(token)
+    return " ".join(result)
+
+
+def _merge_number_fragments(text: str) -> str:
+    """Merge fragmented number words that _merge_fragments may miss (bug #3).
+
+    'sev en' -> 'seven', 'thir ty' -> 'thirty'
+    """
+    tokens = text.split()
+    result: list[str] = []
+    i = 0
+    while i < len(tokens):
+        if i + 1 < len(tokens):
+            pair = (tokens[i], tokens[i + 1])
+            if pair in _NUMBER_FRAGMENTS:
+                result.append(_NUMBER_FRAGMENTS[pair])
+                i += 2
+                continue
+        result.append(tokens[i])
+        i += 1
+    return " ".join(result)
 
 
 def _normalize(text: str) -> str:
@@ -163,6 +346,10 @@ def _normalize(text: str) -> str:
     cleaned = re.sub(r"\s+", " ", cleaned).strip().lower()
     # Merge fragmented tokens into known words
     cleaned = _merge_fragments(cleaned)
+    # Merge number-specific fragments (bug #3)
+    cleaned = _merge_number_fragments(cleaned)
+    # Split glued words (bug #4): 'isthirty' -> 'is thirty'
+    cleaned = _split_glued_words(cleaned)
     return cleaned
 
 
@@ -229,6 +416,15 @@ def _dedup_chars(word: str) -> Optional[str]:
         trimmed = word[trim:]
         if trimmed in _KNOWN_WORDS:
             return trimmed
+
+    # 3. Fuzzy match against number words (Bug 1: handles mangled second words)
+    fuzzy = _fuzzy_match_number_word(word)
+    if fuzzy:
+        return fuzzy
+
+    # 4. Check teen misspelling table directly
+    if word in _TEEN_MISSPELLINGS:
+        return _TEEN_MISSPELLINGS[word]
 
     return None
 
@@ -305,10 +501,26 @@ def _parse_number_word(text: str) -> Optional[float]:
         # "hundred"
         if word == "hundred":
             return 100.0
+        # Bug 3: Try fuzzy match for obfuscated single numbers
+        fuzzy = _fuzzy_match_number_word(word)
+        if fuzzy:
+            if fuzzy in ONES:
+                return float(ONES[fuzzy])
+            if fuzzy in TENS:
+                return float(TENS[fuzzy])
         return None
 
     if len(parts) == 2:
         w1, w2 = parts
+        # Bug 1: fuzzy-match second word of compound numbers
+        if w1 not in TENS:
+            fw1 = _fuzzy_match_number_word(w1)
+            if fw1:
+                w1 = fw1
+        if w2 not in ONES:
+            fw2 = _fuzzy_match_number_word(w2)
+            if fw2:
+                w2 = fw2
         if w1 in TENS and w2 in ONES:
             return float(TENS[w1] + ONES[w2])
         if w1 in ONES and w2 == "hundred":
@@ -327,6 +539,51 @@ def _parse_number_word(text: str) -> Optional[float]:
     return None
 
 
+def _detect_pressure_area(text: str) -> bool:
+    """Detect pressure x area pattern (bug #5).
+
+    'X per square centimeter over/across Y square centimeters' -> multiplication.
+    Pattern: 'per' ... 'over|across|on' -> pressure * area = force.
+    """
+    lower = text.lower()
+    if "per" in lower and re.search(r"\b(?:over|across|on)\b", lower):
+        # Check for unit pattern: "per [square] <unit>" ... "over/across" ... "<unit>"
+        if re.search(r"per\s+(?:square\s+)?\w+.*?\b(?:over|across|on)\b", lower):
+            return True
+    return False
+
+
+def _is_separator_divided(text: str) -> bool:
+    """Check if 'divided' is used as a separator, not an operator (bug #1).
+
+    'divided and another lobster adds twelve' — 'divided' before 'and' without
+    a number immediately after is a separator. The real operator is later.
+    """
+    lower = text.lower()
+    words_list = lower.split()
+    if "divided" not in words_list:
+        return False
+    # 'divided by' is always a real operator
+    div_idx = words_list.index("divided")
+    if div_idx + 1 < len(words_list) and words_list[div_idx + 1] == "by":
+        return False
+    # Check if there's an add/sub operator word AFTER 'divided'
+    after_divided = " ".join(words_list[div_idx + 1:])
+    after_words = set(after_divided.split())
+    if after_words & ADD_WORDS or after_words & SUB_WORDS:
+        # Check that 'divided' is NOT immediately followed by a number
+        # If there's 'and' or non-number words between divided and next number,
+        # it's a separator
+        remaining = words_list[div_idx + 1:]
+        for w in remaining[:3]:  # Check next few words
+            if _parse_number_word(w) is not None:
+                return False  # Number right after -> real division
+            if w in ("and", "but", "then", "another", "also"):
+                return True  # Separator word -> 'divided' is separator
+        return True
+    return False
+
+
 def _detect_operator(text: str) -> Optional[str]:
     """Find the math operator in the challenge text.
 
@@ -337,22 +594,40 @@ def _detect_operator(text: str) -> Optional[str]:
     """
     lower = text.lower()
 
+    # Bug #2: Physics keyword detection before normal operator extraction
+    for phrase, op in PHYSICS_PHRASES.items():
+        if phrase in lower:
+            _log(f"Detected physics keyword '{phrase}' -> operator '{op}'")
+            return op
+
+    # Bug #5: Pressure x area pattern overrides normal operator detection
+    if _detect_pressure_area(lower):
+        _log("Detected pressure x area pattern -> multiplication")
+        return "*"
+
     # Multi-word phrases first (mul/div before add/sub)
     for op in ["*", "/", "+", "-"]:
         for phrase in MULTI_WORD_OPS.get(op, []):
             if phrase in lower:
                 return op
 
+    # Bug #1: Check if 'divided' is a separator, not an operator
+    separator_divided = _is_separator_divided(lower)
+
     # Single words (mul/div before add/sub)
     words = set(lower.split())
     if words & MUL_WORDS:
         return "*"
-    if words & DIV_WORDS:
+    if not separator_divided and (words & DIV_WORDS):
         return "/"
     if words & ADD_WORDS:
         return "+"
     if words & SUB_WORDS:
         return "-"
+    # If divided was a separator and we found no other operator, fall through
+    if separator_divided and (words & DIV_WORDS):
+        # Last resort: maybe it really is division after all
+        return "/"
     return None
 
 
@@ -555,6 +830,14 @@ class MoltbookAPI:
             "verification_code": vc,
             "answer": answer,
         })
+        # Bug #6: Log full details when verification is rejected for debugging
+        is_success = verify_result.get("success") or verify_result.get("verified")
+        if not is_success:
+            _log(
+                f"VERIFICATION REJECTED — challenge: {challenge!r} | "
+                f"computed answer: {answer} | "
+                f"server response: {json.dumps(verify_result)}"
+            )
         return {
             **response,
             "verification_result": verify_result,
