@@ -217,6 +217,7 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         moltbook_stats_service=moltbook_stats_service,
         moltbook_notify_service=moltbook_notify_service,
         memory_sync_service=memory_sync_service,
+        storage=storage,
         suppress_quiet_heartbeats=True,
     )
     agent_handler.register()

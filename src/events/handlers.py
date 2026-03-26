@@ -46,12 +46,14 @@ class AgentHandler:
         moltbook_notify_service: Optional[MoltbookNotifyService] = None,
         reminder_service: Optional[ReminderService] = None,
         memory_sync_service: Optional[MemorySyncService] = None,
+        storage: Optional[Any] = None,
         suppress_quiet_heartbeats: bool = True,
     ) -> None:
         self.event_bus = event_bus
         self.claude = claude_integration
         self.default_working_directory = default_working_directory
         self.default_user_id = default_user_id
+        self.storage = storage
         self.heartbeat = heartbeat_service
         self.x_digest = x_digest_service
         self.moltbook_stats = moltbook_stats_service
@@ -86,6 +88,7 @@ class AgentHandler:
                 user_id=self.default_user_id,
             )
             self._fire_memory_sync()
+            await self._log_scheduled_interaction(prompt, response, self.default_user_id)
 
             if response.content:
                 # We don't know which chat to send to from a webhook alone.
@@ -158,6 +161,7 @@ class AgentHandler:
                 user_id=user_id,
             )
             self._fire_memory_sync()
+            await self._log_scheduled_interaction(prompt, response, user_id)
 
             if response.content:
                 await self._broadcast_response(
@@ -215,6 +219,7 @@ class AgentHandler:
                 user_id=user_id,
             )
             self._fire_memory_sync()
+            await self._log_scheduled_interaction(prompt, response, user_id)
 
             if response.content:
                 header = f"🫀 <b>Heartbeat — {len(result.signals)} signal(s)</b>\n\n"
@@ -272,6 +277,7 @@ class AgentHandler:
                 user_id=user_id,
             )
             self._fire_memory_sync()
+            await self._log_scheduled_interaction(prompt, response, user_id)
 
             if response.content:
                 header = (
@@ -326,6 +332,7 @@ class AgentHandler:
                 user_id=user_id,
             )
             self._fire_memory_sync()
+            await self._log_scheduled_interaction(prompt, response, user_id)
 
             if response.content:
                 header = (
@@ -444,6 +451,23 @@ class AgentHandler:
         except Exception as e:
             logger.warning("Relay alert failed", error=str(e))
             return False
+
+    async def _log_scheduled_interaction(
+        self, prompt: str, response: Any, user_id: int
+    ) -> None:
+        """Log a scheduled job's Claude interaction to the messages table."""
+        if not self.storage:
+            return
+        try:
+            await self.storage.save_claude_interaction(
+                user_id=user_id,
+                session_id=getattr(response, "session_id", "scheduled"),
+                prompt=prompt,
+                response=response,
+                ip_address=None,
+            )
+        except Exception:
+            logger.debug("Failed to log scheduled interaction", exc_info=True)
 
     def _fire_memory_sync(self) -> None:
         """Fire-and-forget memory sync and reminder processing after Claude response."""
