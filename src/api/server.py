@@ -9,12 +9,15 @@ from typing import Any, Dict, Optional
 
 import structlog
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 
 from ..config.settings import Settings
 from ..events.bus import EventBus
 from ..events.types import WebhookEvent
 from ..storage.database import DatabaseManager
 from .auth import verify_github_signature, verify_shared_secret
+from .dashboard_routes import configure as configure_dashboard
+from .dashboard_routes import router as dashboard_router
 
 logger = structlog.get_logger()
 
@@ -32,6 +35,19 @@ def create_api_app(
         docs_url="/docs" if settings.development_mode else None,
         redoc_url=None,
     )
+
+    # CORS for frontend dev server
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Mount dashboard API
+    configure_dashboard(settings=settings, event_bus=event_bus, db_manager=db_manager)
+    app.include_router(dashboard_router)
 
     @app.get("/health")
     async def health_check() -> Dict[str, str]:

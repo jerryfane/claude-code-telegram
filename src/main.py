@@ -160,6 +160,9 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     # --- Event bus and agentic platform components ---
     event_bus = EventBus()
 
+    # Wire event bus to SDK manager for dashboard live streaming
+    sdk_manager.event_bus = event_bus
+
     # Event security middleware
     event_security = EventSecurityMiddleware(
         event_bus=event_bus,

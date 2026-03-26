@@ -29,6 +29,8 @@ from claude_agent_sdk._internal.message_parser import parse_message
 from claude_agent_sdk.types import StreamEvent
 
 from ..config.settings import Settings
+from ..events.bus import EventBus
+from ..events.types import DashboardStreamEvent
 from ..security.validators import SecurityValidator
 from .exceptions import (
     ClaudeMCPError,
@@ -133,10 +135,12 @@ class ClaudeSDKManager:
         self,
         config: Settings,
         security_validator: Optional[SecurityValidator] = None,
+        event_bus: Optional[EventBus] = None,
     ):
         """Initialize SDK manager with configuration."""
         self.config = config
         self.security_validator = security_validator
+        self.event_bus = event_bus
 
         # Set up environment for Claude Code SDK if API key is provided
         # If no API key is provided, the SDK will use existing CLI authentication
@@ -306,6 +310,14 @@ class ClaudeSDKManager:
                     session_id=session_id,
                 )
 
+            # Publish session start to dashboard
+            await self._publish_dashboard_event(
+                event_kind="SESSION_START",
+                content=f"Session started in {working_directory}",
+                session_id=session_id,
+                user_id=user_id,
+            )
+
             # Collect messages via ClaudeSDKClient
             messages: List[Message] = []
 
@@ -345,7 +357,10 @@ class ClaudeSDKManager:
                         if stream_callback:
                             try:
                                 await self._handle_stream_message(
-                                    message, stream_callback
+                                    message,
+                                    stream_callback,
+                                    session_id=session_id,
+                                    user_id=user_id,
                                 )
                             except Exception as callback_error:
                                 logger.warning(
@@ -431,6 +446,14 @@ class ClaudeSDKManager:
                         elif msg_content:
                             content_parts.append(str(msg_content))
                 content = "\n".join(content_parts)
+
+            # Publish final response to dashboard
+            await self._publish_dashboard_event(
+                event_kind="RESPONSE",
+                content=content[:500] if content else "",
+                session_id=final_session_id,
+                user_id=user_id,
+            )
 
             return ClaudeResponse(
                 content=content,
@@ -524,7 +547,11 @@ class ClaudeSDKManager:
             raise ClaudeProcessError(f"Unexpected error: {str(e)}")
 
     async def _handle_stream_message(
-        self, message: Message, stream_callback: Callable[[StreamUpdate], None]
+        self,
+        message: Message,
+        stream_callback: Callable[[StreamUpdate], None],
+        session_id: Optional[str] = None,
+        user_id: Optional[int] = None,
     ) -> None:
         """Handle streaming message from claude-agent-sdk."""
         try:
@@ -554,6 +581,24 @@ class ClaudeSDKManager:
                         tool_calls=tool_calls if tool_calls else None,
                     )
                     await stream_callback(update)
+
+                    # Publish dashboard events
+                    if text_parts:
+                        await self._publish_dashboard_event(
+                            event_kind="THINKING",
+                            content="\n".join(text_parts),
+                            session_id=session_id,
+                            user_id=user_id,
+                        )
+                    for tc in tool_calls:
+                        await self._publish_dashboard_event(
+                            event_kind="TOOL_CALL",
+                            content=tc.get("name", "unknown"),
+                            tool_name=tc.get("name"),
+                            tool_input=tc.get("input"),
+                            session_id=session_id,
+                            user_id=user_id,
+                        )
                 elif content:
                     # Fallback for non-list content
                     update = StreamUpdate(
@@ -583,9 +628,40 @@ class ClaudeSDKManager:
                         content=content,
                     )
                     await stream_callback(update)
+                    await self._publish_dashboard_event(
+                        event_kind="TOOL_RESULT",
+                        content=str(content)[:500],
+                        session_id=session_id,
+                        user_id=user_id,
+                    )
 
         except Exception as e:
             logger.warning("Stream callback failed", error=str(e))
+
+    async def _publish_dashboard_event(
+        self,
+        event_kind: str,
+        content: str,
+        session_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+        tool_name: Optional[str] = None,
+        tool_input: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Publish a DashboardStreamEvent to the EventBus if available."""
+        if not self.event_bus:
+            return
+        try:
+            event = DashboardStreamEvent(
+                event_kind=event_kind,
+                session_id=session_id or "",
+                user_id=user_id or 0,
+                content=content,
+                tool_name=tool_name,
+                tool_input=tool_input,
+            )
+            await self.event_bus.publish(event)
+        except Exception:
+            pass  # never let dashboard publishing break the main flow
 
     def _load_mcp_config(self, config_path: Path) -> Dict[str, Any]:
         """Load MCP server configuration from a JSON file.

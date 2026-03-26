@@ -53,3 +53,19 @@ class AgentResponseEvent(Event):
     reply_to_message_id: Optional[int] = None
     source: str = "agent"
     originating_event_id: Optional[str] = None
+
+
+@dataclass
+class DashboardStreamEvent(Event):
+    """Live agent activity streamed to the web dashboard.
+
+    Published from SDK streaming callbacks and consumed by the SSE endpoint.
+    """
+
+    event_kind: str = ""  # THINKING, TOOL_CALL, TOOL_RESULT, RESPONSE, ERROR, SESSION_START, SESSION_END
+    session_id: str = ""
+    user_id: int = 0
+    content: str = ""
+    tool_name: Optional[str] = None
+    tool_input: Optional[Dict[str, Any]] = None
+    source: str = "dashboard"

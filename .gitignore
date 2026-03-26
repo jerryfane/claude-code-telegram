@@ -156,3 +156,7 @@ config/mcp.json
 
 /repos/
 ecosystem.config.js
+
+# Frontend
+node_modules/
+website/frontend/dist/

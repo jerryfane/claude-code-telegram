@@ -267,6 +267,10 @@ class Settings(BaseSettings):
     webhook_api_secret: Optional[str] = Field(
         None, description="Shared secret for generic webhook providers"
     )
+    dashboard_secret: Optional[str] = Field(
+        None,
+        description="Bearer token for dashboard API access. Falls back to WEBHOOK_API_SECRET.",
+    )
     notification_chat_ids: Optional[List[int]] = Field(
         None, description="Default Telegram chat IDs for proactive notifications"
     )
@@ -532,6 +536,11 @@ class Settings(BaseSettings):
         if self.voice_provider == "openai":
             return "OpenAI Whisper"
         return "Mistral Voxtral"
+
+    @property
+    def resolved_dashboard_secret(self) -> Optional[str]:
+        """Dashboard API secret, falling back to webhook_api_secret."""
+        return self.dashboard_secret or self.webhook_api_secret
 
     @property
     def resolved_memory_dir(self) -> Optional[Path]:
