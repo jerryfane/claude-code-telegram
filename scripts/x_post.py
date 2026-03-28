@@ -269,6 +269,23 @@ async def _get_screen_name() -> str:
     return os.environ.get("X_USERNAME", "unknown")
 
 
+def _format_tweet(t) -> dict:
+    """Format a twikit Tweet object into a dict for JSON output."""
+    author = getattr(t, "user", None)
+    screen_name = author.screen_name if author else None
+    return {
+        "id": t.id,
+        "author": screen_name,
+        "author_name": author.name if author else None,
+        "text": t.text,
+        "created_at": t.created_at,
+        "favorite_count": t.favorite_count,
+        "retweet_count": t.retweet_count,
+        "reply_count": t.reply_count,
+        "url": _tweet_url(screen_name, t.id) if screen_name else None,
+    }
+
+
 async def cmd_tweet(args: argparse.Namespace) -> None:
     text = _validate_text(args.text)
     client = await _get_client()
@@ -423,21 +440,72 @@ async def cmd_timeline(args: argparse.Namespace) -> None:
     )
     client.save_cookies(str(COOKIES_PATH))
 
-    tweet_list = []
-    for t in tweets:
-        tweet_list.append({
-            "id": t.id,
-            "text": t.text,
-            "created_at": t.created_at,
-            "favorite_count": t.favorite_count,
-            "retweet_count": t.retweet_count,
-            "reply_count": t.reply_count,
-            "url": _tweet_url(screen_name, t.id),
-        })
-
+    tweet_list = [_format_tweet(t) for t in tweets]
     _output({
         "success": True,
         "screen_name": screen_name,
+        "count": len(tweet_list),
+        "tweets": tweet_list,
+    })
+
+
+async def cmd_feed(args: argparse.Namespace) -> None:
+    client = await _get_client()
+    tweets = await _run_with_retry(
+        lambda: client.get_timeline(count=args.limit)
+    )
+    client.save_cookies(str(COOKIES_PATH))
+
+    tweet_list = [_format_tweet(t) for t in tweets]
+    _output({"success": True, "count": len(tweet_list), "tweets": tweet_list})
+
+
+async def cmd_mentions(args: argparse.Namespace) -> None:
+    client = await _get_client()
+    screen_name = os.environ.get("X_USERNAME", "")
+
+    if not screen_name:
+        _error_exit("X_USERNAME environment variable is required for mentions.")
+
+    tweets = await _run_with_retry(
+        lambda: client.search_tweet(f"@{screen_name}", product="Latest", count=args.limit)
+    )
+    client.save_cookies(str(COOKIES_PATH))
+
+    tweet_list = [_format_tweet(t) for t in tweets]
+    _output({"success": True, "count": len(tweet_list), "tweets": tweet_list})
+
+
+async def cmd_search(args: argparse.Namespace) -> None:
+    client = await _get_client()
+    tweets = await _run_with_retry(
+        lambda: client.search_tweet(args.query, product="Latest", count=args.limit)
+    )
+    client.save_cookies(str(COOKIES_PATH))
+
+    tweet_list = [_format_tweet(t) for t in tweets]
+    _output({
+        "success": True,
+        "query": args.query,
+        "count": len(tweet_list),
+        "tweets": tweet_list,
+    })
+
+
+async def cmd_user(args: argparse.Namespace) -> None:
+    client = await _get_client()
+    user = await _run_with_retry(
+        lambda: client.get_user_by_screen_name(args.screen_name)
+    )
+    tweets = await _run_with_retry(
+        lambda: user.get_tweets("Tweets", count=args.limit)
+    )
+    client.save_cookies(str(COOKIES_PATH))
+
+    tweet_list = [_format_tweet(t) for t in tweets]
+    _output({
+        "success": True,
+        "screen_name": args.screen_name,
         "count": len(tweet_list),
         "tweets": tweet_list,
     })
@@ -488,6 +556,24 @@ def main() -> None:
     p_timeline = sub.add_parser("timeline", help="Get recent tweets from our account")
     p_timeline.add_argument("--limit", type=int, default=10, help="Number of tweets")
 
+    # feed
+    p_feed = sub.add_parser("feed", help="Home timeline from followed accounts")
+    p_feed.add_argument("--limit", type=int, default=20, help="Number of tweets")
+
+    # mentions
+    p_mentions = sub.add_parser("mentions", help="Check our mentions")
+    p_mentions.add_argument("--limit", type=int, default=10, help="Number of tweets")
+
+    # search
+    p_search = sub.add_parser("search", help="Search tweets")
+    p_search.add_argument("query", help="Search query")
+    p_search.add_argument("--limit", type=int, default=10, help="Number of tweets")
+
+    # user
+    p_user = sub.add_parser("user", help="View a user's tweets")
+    p_user.add_argument("screen_name", help="Username")
+    p_user.add_argument("--limit", type=int, default=10, help="Number of tweets")
+
     cmd_map = {
         "tweet": cmd_tweet,
         "thread": cmd_thread,
@@ -497,6 +583,10 @@ def main() -> None:
         "unfollow": cmd_unfollow,
         "delete": cmd_delete,
         "timeline": cmd_timeline,
+        "feed": cmd_feed,
+        "mentions": cmd_mentions,
+        "search": cmd_search,
+        "user": cmd_user,
     }
 
     args = parser.parse_args()
