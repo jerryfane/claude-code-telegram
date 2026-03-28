@@ -17,6 +17,8 @@ from ..scheduler.moltbook_notify import MoltbookNotifyService
 from ..scheduler.moltbook_stats import MoltbookStatsService
 from ..scheduler.reminder import ReminderService
 from ..scheduler.x_digest import XDigestService
+from ..scheduler.x_mentions import XMentionsService
+from ..scheduler.x_stats import XStatsService
 from .bus import Event, EventBus
 from .types import AgentResponseEvent, ScheduledEvent, WebhookEvent
 
@@ -44,6 +46,8 @@ class AgentHandler:
         x_digest_service: Optional[XDigestService] = None,
         moltbook_stats_service: Optional[MoltbookStatsService] = None,
         moltbook_notify_service: Optional[MoltbookNotifyService] = None,
+        x_mentions_service: Optional[XMentionsService] = None,
+        x_stats_service: Optional[XStatsService] = None,
         reminder_service: Optional[ReminderService] = None,
         memory_sync_service: Optional[MemorySyncService] = None,
         storage: Optional[Any] = None,
@@ -58,6 +62,8 @@ class AgentHandler:
         self.x_digest = x_digest_service
         self.moltbook_stats = moltbook_stats_service
         self.moltbook_notify = moltbook_notify_service
+        self.x_mentions = x_mentions_service
+        self.x_stats = x_stats_service
         self.reminder = reminder_service
         self.memory_sync = memory_sync_service
         self.suppress_quiet_heartbeats = suppress_quiet_heartbeats
@@ -143,6 +149,21 @@ class AgentHandler:
         # Moltbook stats: poll API for post performance (no Claude needed)
         if event.skill_name == "moltbook_stats" and self.moltbook_stats:
             await self._handle_moltbook_stats(event)
+            return
+
+        # X mentions: check for @mentions (no Claude needed)
+        if event.skill_name == "x_mentions" and self.x_mentions:
+            await self._handle_x_mentions(event)
+            return
+
+        # X stats: daily stats summary (no Claude needed)
+        if event.skill_name == "x_stats" and self.x_stats:
+            await self._handle_x_stats(event)
+            return
+
+        # X lurk: read feed then engage via Claude
+        if event.skill_name == "x_lurk":
+            await self._handle_x_lurk(event)
             return
 
         prompt = event.prompt
@@ -387,6 +408,144 @@ class AgentHandler:
         except Exception:
             logger.exception(
                 "Moltbook stats handler failed",
+                job_id=event.job_id,
+                event_id=event.id,
+            )
+
+    async def _handle_x_mentions(self, event: ScheduledEvent) -> None:
+        """Check X mentions — no Claude, pure script ($0)."""
+        assert self.x_mentions is not None
+
+        try:
+            result = await self.x_mentions.run()
+
+            if result.error:
+                logger.error("X mentions check failed", error=result.error)
+                return
+
+            if not result.has_mentions:
+                logger.info("X mentions: no new mentions")
+                return  # Silent — don't spam if nothing new
+
+            await self._broadcast_response(
+                event.target_chat_ids,
+                result.summary,
+                event.id,
+            )
+
+        except Exception:
+            logger.exception(
+                "X mentions handler failed",
+                job_id=event.job_id,
+                event_id=event.id,
+            )
+
+    async def _handle_x_stats(self, event: ScheduledEvent) -> None:
+        """Daily X stats summary — no Claude, pure script ($0)."""
+        assert self.x_stats is not None
+
+        try:
+            result = await self.x_stats.run()
+
+            if result.error:
+                logger.error("X stats failed", error=result.error)
+                await self._broadcast_response(
+                    event.target_chat_ids,
+                    f"X stats failed: {result.error}",
+                    event.id,
+                )
+                return
+
+            if not result.has_results:
+                logger.info("X stats: no results")
+                return
+
+            await self._broadcast_response(
+                event.target_chat_ids,
+                result.summary,
+                event.id,
+            )
+
+        except Exception:
+            logger.exception(
+                "X stats handler failed",
+                job_id=event.job_id,
+                event_id=event.id,
+            )
+
+    async def _handle_x_lurk(self, event: ScheduledEvent) -> None:
+        """Read X feed then engage via Claude — two-phase like x_digest."""
+        import asyncio as _asyncio
+        import json
+        import sys as _sys
+
+        try:
+            # Phase 1: Get feed data via x_post.py
+            script_path = self.default_working_directory / "scripts" / "x_post.py"
+            proc = await _asyncio.create_subprocess_exec(
+                _sys.executable,
+                str(script_path),
+                "feed",
+                "--limit", "20",
+                cwd=str(self.default_working_directory),
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await _asyncio.wait_for(
+                proc.communicate(), timeout=60
+            )
+            feed_text = stdout.decode().strip()
+
+            if proc.returncode != 0 or not feed_text:
+                logger.error("X lurk feed fetch failed", stderr=stderr.decode()[:200])
+                return
+
+            feed_data = json.loads(feed_text)
+            tweets = feed_data.get("tweets", [])
+            if not tweets:
+                logger.info("X lurk: empty feed")
+                return
+
+            # Phase 2: Ask Claude to analyze and engage
+            feed_summary = "\n".join(
+                f"- @{t['author']}: \"{t['text'][:200]}\" "
+                f"({t['favorite_count']}♥ {t['retweet_count']}🔁) "
+                f"→ {t['url']}"
+                for t in tweets[:20]
+            )
+
+            prompt = (
+                f"Here's the current X/Twitter feed ({len(tweets)} tweets):\n\n"
+                f"{feed_summary}\n\n"
+                f"Review the feed. Find 1-2 interesting threads to engage with — "
+                f"prioritize AI agents, builders, technical content, or anything "
+                f"related to our work (Claude on Raspberry Pi, Moltbook, autonomous agents). "
+                f"If you find something worth engaging, use scripts/x_post.py to reply or quote. "
+                f"Keep replies concise, genuine, and technical. If nothing is worth engaging "
+                f"with, just say so — don't force it."
+            )
+
+            working_dir = event.working_directory or self.default_working_directory
+            user_id = event.user_id or self.default_user_id
+            response = await self.claude.run_command(
+                prompt=prompt,
+                working_directory=working_dir,
+                user_id=user_id,
+            )
+            self._fire_memory_sync()
+            await self._log_scheduled_interaction(prompt, response, user_id)
+
+            if response.content:
+                header = f"👀 <b>X Lurk — {len(tweets)} tweets scanned</b>\n\n"
+                await self._broadcast_response(
+                    event.target_chat_ids,
+                    header + response.content,
+                    event.id,
+                )
+
+        except Exception:
+            logger.exception(
+                "X lurk handler failed",
                 job_id=event.job_id,
                 event_id=event.id,
             )

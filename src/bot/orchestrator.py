@@ -1865,6 +1865,12 @@ class MessageOrchestrator:
             if test_target == "moltbook_notify":
                 await self._cron_test_moltbook_notify(update, context)
                 return
+            if test_target == "x_mentions":
+                await self._cron_test_x_mentions(update, context)
+                return
+            if test_target == "x_stats":
+                await self._cron_test_x_stats(update, context)
+                return
 
         if subcmd == "heartbeat":
             cron_expr = " ".join(raw_args[1:])
@@ -1970,6 +1976,90 @@ class MessageOrchestrator:
                 )
                 await update.message.reply_text(
                     f"Moltbook notify job added.\n"
+                    f"ID: <code>{escape_html(job_id)}</code>\n"
+                    f"Schedule: <code>{escape_html(cron_expr)}</code>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                await update.message.reply_text(f"Failed to add job: {e}")
+            return
+
+        if subcmd == "x_mentions":
+            cron_expr = " ".join(raw_args[1:])
+            if not cron_expr:
+                await update.message.reply_text(
+                    "Usage: <code>/cron x_mentions */30 * * * *</code>",
+                    parse_mode="HTML",
+                )
+                return
+            try:
+                config = self.settings
+                job_id = await scheduler.add_job(
+                    job_name="X Mentions",
+                    cron_expression=cron_expr,
+                    prompt="",
+                    target_chat_ids=config.notification_chat_ids or [],
+                    skill_name="x_mentions",
+                    created_by=update.effective_user.id,
+                )
+                await update.message.reply_text(
+                    f"X mentions job added.\n"
+                    f"ID: <code>{escape_html(job_id)}</code>\n"
+                    f"Schedule: <code>{escape_html(cron_expr)}</code>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                await update.message.reply_text(f"Failed to add job: {e}")
+            return
+
+        if subcmd == "x_stats":
+            cron_expr = " ".join(raw_args[1:])
+            if not cron_expr:
+                await update.message.reply_text(
+                    "Usage: <code>/cron x_stats 0 0 * * *</code>",
+                    parse_mode="HTML",
+                )
+                return
+            try:
+                config = self.settings
+                job_id = await scheduler.add_job(
+                    job_name="X Stats",
+                    cron_expression=cron_expr,
+                    prompt="",
+                    target_chat_ids=config.notification_chat_ids or [],
+                    skill_name="x_stats",
+                    created_by=update.effective_user.id,
+                )
+                await update.message.reply_text(
+                    f"X stats job added.\n"
+                    f"ID: <code>{escape_html(job_id)}</code>\n"
+                    f"Schedule: <code>{escape_html(cron_expr)}</code>",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                await update.message.reply_text(f"Failed to add job: {e}")
+            return
+
+        if subcmd == "x_lurk":
+            cron_expr = " ".join(raw_args[1:])
+            if not cron_expr:
+                await update.message.reply_text(
+                    "Usage: <code>/cron x_lurk 0 * * * *</code>",
+                    parse_mode="HTML",
+                )
+                return
+            try:
+                config = self.settings
+                job_id = await scheduler.add_job(
+                    job_name="X Lurk",
+                    cron_expression=cron_expr,
+                    prompt="",
+                    target_chat_ids=config.notification_chat_ids or [],
+                    skill_name="x_lurk",
+                    created_by=update.effective_user.id,
+                )
+                await update.message.reply_text(
+                    f"X lurk job added.\n"
                     f"ID: <code>{escape_html(job_id)}</code>\n"
                     f"Schedule: <code>{escape_html(cron_expr)}</code>",
                     parse_mode="HTML",
@@ -2253,6 +2343,58 @@ class MessageOrchestrator:
             lines.append(f"• [{ntype}] from @{escape_html(agent)}")
         lines.append("\nA real run would invoke Claude to reply to these.")
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def _cron_test_x_mentions(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Check X mentions (dry-run)."""
+        from ..scheduler.x_mentions import XMentionsService
+
+        svc: Optional[XMentionsService] = context.bot_data.get("x_mentions_service")
+        if not svc:
+            await update.message.reply_text("XMentionsService is not available.")
+            return
+
+        await update.message.reply_text("Checking X mentions...")
+        await update.message.chat.send_action("typing")
+        result = await svc.run()
+
+        if result.error:
+            await update.message.reply_text(
+                f"X mentions failed: {escape_html(str(result.error))}",
+                parse_mode="HTML",
+            )
+            return
+
+        if not result.has_mentions:
+            await update.message.reply_text("🐦 No new mentions.")
+            return
+
+        await update.message.reply_text(result.summary, parse_mode="HTML")
+
+    async def _cron_test_x_stats(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Get X stats (dry-run)."""
+        from ..scheduler.x_stats import XStatsService
+
+        svc: Optional[XStatsService] = context.bot_data.get("x_stats_service")
+        if not svc:
+            await update.message.reply_text("XStatsService is not available.")
+            return
+
+        await update.message.reply_text("Fetching X stats...")
+        await update.message.chat.send_action("typing")
+        result = await svc.run()
+
+        if result.error:
+            await update.message.reply_text(
+                f"X stats failed: {escape_html(str(result.error))}",
+                parse_mode="HTML",
+            )
+            return
+
+        await update.message.reply_text(result.summary, parse_mode="HTML")
 
     async def agentic_moltbook(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

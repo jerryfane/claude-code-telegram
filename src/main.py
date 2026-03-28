@@ -33,6 +33,8 @@ from src.scheduler.moltbook_stats import MoltbookStatsService
 from src.scheduler.reminder import ReminderService
 from src.scheduler.scheduler import JobScheduler
 from src.scheduler.x_digest import XDigestService
+from src.scheduler.x_mentions import XMentionsService
+from src.scheduler.x_stats import XStatsService
 from src.security.audit import AuditLogger, InMemoryAuditStorage
 from src.security.auth import (
     AuthenticationManager,
@@ -192,6 +194,16 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         working_directory=config.approved_directory,
     )
 
+    # X mentions service — mention checker (no Claude)
+    x_mentions_service = XMentionsService(
+        working_directory=config.approved_directory,
+    )
+
+    # X stats service — daily stats summary (no Claude)
+    x_stats_service = XStatsService(
+        working_directory=config.approved_directory,
+    )
+
     # Code agent service — spawns claude CLI sub-agents
     code_agent_service = CodeAgentService(
         working_directory=config.approved_directory,
@@ -216,6 +228,8 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         x_digest_service=x_digest_service,
         moltbook_stats_service=moltbook_stats_service,
         moltbook_notify_service=moltbook_notify_service,
+        x_mentions_service=x_mentions_service,
+        x_stats_service=x_stats_service,
         memory_sync_service=memory_sync_service,
         storage=storage,
         suppress_quiet_heartbeats=True,
@@ -241,6 +255,8 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     bot.deps["code_agent_service"] = code_agent_service
     bot.deps["moltbook_stats_service"] = moltbook_stats_service
     bot.deps["moltbook_notify_service"] = moltbook_notify_service
+    bot.deps["x_mentions_service"] = x_mentions_service
+    bot.deps["x_stats_service"] = x_stats_service
     if memory_sync_service:
         bot.deps["memory_sync_service"] = memory_sync_service
 
