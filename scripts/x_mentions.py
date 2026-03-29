@@ -211,6 +211,15 @@ async def run(dry_run: bool = False) -> None:
         except Exception as e2:
             _log(f"Re-login failed: {e2}")
             sys.exit(1)
+    except Exception as e:
+        err_str = str(e)
+        if "404" in err_str:
+            _log("Search returned 404 — possibly throttled. Will retry next cycle.")
+            return
+        if "226" in err_str:
+            _log("Error 226: X detected automated behavior. Will retry next cycle.")
+            return
+        raise
 
     client.save_cookies(str(COOKIES_PATH))
 

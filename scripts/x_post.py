@@ -47,6 +47,7 @@ COOKIES_PATH = DATA_DIR / "x_cookies.json"
 TRANSACTION_CACHE_PATH = DATA_DIR / "x_transaction.json"
 TRANSACTION_CACHE_TTL = 3600
 MAX_TWEET_LENGTH = 280
+WRITE_DELAY = 3  # Seconds between write operations to avoid anti-bot detection
 
 
 def _log(msg: str) -> None:
@@ -229,8 +230,11 @@ async def authenticate(client: Client) -> None:
 # Error wrapper
 # ---------------------------------------------------------------------------
 
-async def _run_with_retry(coro_fn, retries: int = 1):
-    """Run an async callable with retry and auto-reauth on expired cookies."""
+async def _run_with_retry(coro_fn, retries: int = 1, is_write: bool = False):
+    """Run an async callable with retry, auto-reauth, and anti-bot spacing."""
+    if is_write:
+        await asyncio.sleep(WRITE_DELAY)
+
     for attempt in range(retries + 1):
         try:
             return await coro_fn()
@@ -245,7 +249,13 @@ async def _run_with_retry(coro_fn, retries: int = 1):
                 await authenticate(_active_client)
                 continue
             _error_exit("Cookies expired and re-login failed.")
-        except TwitterException:
+        except TwitterException as e:
+            err_str = str(e)
+            if "226" in err_str:
+                _error_exit(
+                    "Error 226: X detected automated behavior. "
+                    "Wait 30-60 minutes before retrying."
+                )
             raise
         except Exception as e:
             if attempt < retries:
@@ -307,7 +317,7 @@ async def cmd_tweet(args: argparse.Namespace) -> None:
             media_ids = [media_id]
         return await client.create_tweet(text=text, media_ids=media_ids)
 
-    result = await _run_with_retry(_post)
+    result = await _run_with_retry(_post, is_write=True)
     client.save_cookies(str(COOKIES_PATH))
 
     _output({
@@ -329,7 +339,8 @@ async def cmd_thread(args: argparse.Namespace) -> None:
     thread = []
 
     first = await _run_with_retry(
-        lambda: client.create_tweet(text=texts[0])
+        lambda: client.create_tweet(text=texts[0]),
+        is_write=True,
     )
     thread.append({
         "tweet_id": first.id,
@@ -341,7 +352,8 @@ async def cmd_thread(args: argparse.Namespace) -> None:
     prev = first
     for t in texts[1:]:
         reply = await _run_with_retry(
-            lambda t=t, prev=prev: client.create_tweet(text=t, reply_to=prev.id)
+            lambda t=t, prev=prev: client.create_tweet(text=t, reply_to=prev.id),
+            is_write=True,
         )
         thread.append({
             "tweet_id": reply.id,
@@ -361,7 +373,8 @@ async def cmd_reply(args: argparse.Namespace) -> None:
     screen_name = await _get_screen_name()
 
     result = await _run_with_retry(
-        lambda: client.create_tweet(text=text, reply_to=args.tweet_id)
+        lambda: client.create_tweet(text=text, reply_to=args.tweet_id),
+        is_write=True,
     )
     client.save_cookies(str(COOKIES_PATH))
 
@@ -381,7 +394,8 @@ async def cmd_quote(args: argparse.Namespace) -> None:
     screen_name = await _get_screen_name()
 
     result = await _run_with_retry(
-        lambda: client.create_tweet(text=text, quote_tweet_id=args.tweet_id)
+        lambda: client.create_tweet(text=text, quote_tweet_id=args.tweet_id),
+        is_write=True,
     )
     client.save_cookies(str(COOKIES_PATH))
 
@@ -400,7 +414,7 @@ async def cmd_follow(args: argparse.Namespace) -> None:
     user = await _run_with_retry(
         lambda: client.get_user_by_screen_name(args.screen_name)
     )
-    await _run_with_retry(lambda: user.follow())
+    await _run_with_retry(lambda: user.follow(), is_write=True)
     client.save_cookies(str(COOKIES_PATH))
     _output({
         "success": True,
@@ -415,7 +429,7 @@ async def cmd_unfollow(args: argparse.Namespace) -> None:
     user = await _run_with_retry(
         lambda: client.get_user_by_screen_name(args.screen_name)
     )
-    await _run_with_retry(lambda: user.unfollow())
+    await _run_with_retry(lambda: user.unfollow(), is_write=True)
     client.save_cookies(str(COOKIES_PATH))
     _output({
         "success": True,
@@ -427,7 +441,7 @@ async def cmd_unfollow(args: argparse.Namespace) -> None:
 
 async def cmd_like(args: argparse.Namespace) -> None:
     client = await _get_client()
-    await _run_with_retry(lambda: client.favorite_tweet(args.tweet_id))
+    await _run_with_retry(lambda: client.favorite_tweet(args.tweet_id), is_write=True)
     client.save_cookies(str(COOKIES_PATH))
     _output({"success": True, "liked": args.tweet_id})
 
@@ -435,7 +449,7 @@ async def cmd_like(args: argparse.Namespace) -> None:
 async def cmd_delete(args: argparse.Namespace) -> None:
     client = await _get_client()
 
-    await _run_with_retry(lambda: client.delete_tweet(args.tweet_id))
+    await _run_with_retry(lambda: client.delete_tweet(args.tweet_id), is_write=True)
     client.save_cookies(str(COOKIES_PATH))
 
     _output({"success": True, "deleted_tweet_id": args.tweet_id})
