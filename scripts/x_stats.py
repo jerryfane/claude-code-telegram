@@ -214,8 +214,16 @@ async def run(dry_run: bool = False) -> None:
         _log(f"Rate limited: {e}")
         sys.exit(1)
     except (Unauthorized, Forbidden):
-        _log("Cookies expired. Refresh auth_token and ct0.")
-        sys.exit(1)
+        _log("Auth failed, attempting re-login...")
+        COOKIES_PATH.unlink(missing_ok=True)
+        TRANSACTION_CACHE_PATH.unlink(missing_ok=True)
+        await authenticate(client)
+        try:
+            user = await client.get_user_by_screen_name(screen_name)
+            tweets = await user.get_tweets("Tweets", count=20)
+        except Exception as e2:
+            _log(f"Re-login failed: {e2}")
+            sys.exit(1)
 
     client.save_cookies(str(COOKIES_PATH))
 

@@ -230,7 +230,7 @@ async def authenticate(client: Client) -> None:
 # ---------------------------------------------------------------------------
 
 async def _run_with_retry(coro_fn, retries: int = 1):
-    """Run an async callable with one network retry and twikit error handling."""
+    """Run an async callable with retry and auto-reauth on expired cookies."""
     for attempt in range(retries + 1):
         try:
             return await coro_fn()
@@ -238,9 +238,13 @@ async def _run_with_retry(coro_fn, retries: int = 1):
             wait = getattr(e, "retry_after", None) or 60
             _error_exit(f"Rate limited. Retry after {wait}s.")
         except (Unauthorized, Forbidden):
-            _error_exit(
-                "Cookies expired. Refresh auth_token and ct0 from browser DevTools."
-            )
+            if attempt < retries and _active_client is not None:
+                _log("Auth failed, attempting re-login...")
+                COOKIES_PATH.unlink(missing_ok=True)
+                TRANSACTION_CACHE_PATH.unlink(missing_ok=True)
+                await authenticate(_active_client)
+                continue
+            _error_exit("Cookies expired and re-login failed.")
         except TwitterException:
             raise
         except Exception as e:
@@ -259,9 +263,14 @@ def _tweet_url(screen_name: str, tweet_id: str) -> str:
     return f"https://x.com/{screen_name}/status/{tweet_id}"
 
 
+_active_client: Client | None = None
+
+
 async def _get_client() -> Client:
+    global _active_client
     client = Client("en-US")
     await authenticate(client)
+    _active_client = client
     return client
 
 
@@ -416,6 +425,13 @@ async def cmd_unfollow(args: argparse.Namespace) -> None:
     })
 
 
+async def cmd_like(args: argparse.Namespace) -> None:
+    client = await _get_client()
+    await _run_with_retry(lambda: client.favorite_tweet(args.tweet_id))
+    client.save_cookies(str(COOKIES_PATH))
+    _output({"success": True, "liked": args.tweet_id})
+
+
 async def cmd_delete(args: argparse.Namespace) -> None:
     client = await _get_client()
 
@@ -548,6 +564,10 @@ def main() -> None:
     p_unfollow = sub.add_parser("unfollow", help="Unfollow a user")
     p_unfollow.add_argument("screen_name", help="Username to unfollow")
 
+    # like
+    p_like = sub.add_parser("like", help="Like a tweet")
+    p_like.add_argument("tweet_id", help="Tweet ID to like")
+
     # delete
     p_delete = sub.add_parser("delete", help="Delete a tweet")
     p_delete.add_argument("tweet_id", help="Tweet ID to delete")
@@ -581,6 +601,7 @@ def main() -> None:
         "quote": cmd_quote,
         "follow": cmd_follow,
         "unfollow": cmd_unfollow,
+        "like": cmd_like,
         "delete": cmd_delete,
         "timeline": cmd_timeline,
         "feed": cmd_feed,

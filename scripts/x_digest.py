@@ -287,6 +287,7 @@ async def _execute_with_guard(
     guard: RateLimitGuard,
     label: str,
     coro_factory,
+    client: Client | None = None,
 ) -> list:
     """Execute an async call with rate limit guard and retries.
 
@@ -319,8 +320,16 @@ async def _execute_with_guard(
                 continue
             raise
 
-        except (Unauthorized, TwitterException) as e:
-            # Don't retry auth errors or unknown Twitter errors
+        except Unauthorized:
+            if attempt <= MAX_RETRIES:
+                _log(f"{label}: Unauthorized, attempting re-login...")
+                COOKIES_PATH.unlink(missing_ok=True)
+                TRANSACTION_CACHE_PATH.unlink(missing_ok=True)
+                await authenticate(client)
+                continue
+            raise
+
+        except TwitterException:
             raise
 
     return []  # Shouldn't reach here, but safety net
@@ -341,6 +350,7 @@ async def fetch_user_tweets(
             guard,
             topic_label,
             lambda uid=user.id: client.get_user_tweets(uid, "Tweets", count=count),
+            client=client,
         )
         return {
             "topic": topic_label,
@@ -367,6 +377,7 @@ async def search_topic(
             guard,
             topic_name,
             lambda: client.search_tweet(query, product="Latest", count=count),
+            client=client,
         )
         return {
             "topic": topic_name,
