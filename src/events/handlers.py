@@ -5,10 +5,17 @@ NotificationHandler: subscribes to AgentResponseEvent and delivers to Telegram.
 """
 
 import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import structlog
+
+
+def is_sleeping() -> bool:
+    """Phobos sleeps midnight-5am Italian time (22:00-03:00 UTC)."""
+    hour = datetime.now(UTC).hour
+    return hour >= 22 or hour < 3
 
 from ..claude.facade import ClaudeIntegration
 from ..scheduler.heartbeat import HeartbeatService
@@ -151,8 +158,8 @@ class AgentHandler:
             await self._handle_moltbook_stats(event)
             return
 
-        # X mentions: check for @mentions (no Claude needed)
-        if event.skill_name == "x_mentions" and self.x_mentions:
+        # X mentions: fetch mentions then reply via Claude
+        if event.skill_name == "x_mentions":
             await self._handle_x_mentions(event)
             return
 
@@ -164,6 +171,12 @@ class AgentHandler:
         # X lurk: read feed then engage via Claude
         if event.skill_name == "x_lurk":
             await self._handle_x_lurk(event)
+            return
+
+        # Generic scheduled jobs (Moltbook Digest/Post) — skip during sleep
+        if is_sleeping():
+            logger.info("Skipping scheduled job during sleep window (22:00-03:00 UTC)",
+                        job_name=event.job_name)
             return
 
         prompt = event.prompt
@@ -259,6 +272,9 @@ class AgentHandler:
 
     async def _handle_x_digest(self, event: ScheduledEvent) -> None:
         """Run X/Twitter digest: search tweets, then summarize with Claude."""
+        if is_sleeping():
+            logger.info("Skipping x_digest during sleep window")
+            return
         assert self.x_digest is not None
 
         try:
@@ -321,6 +337,9 @@ class AgentHandler:
 
     async def _handle_moltbook_notify(self, event: ScheduledEvent) -> None:
         """Two-phase Moltbook notification check: cheap API call first, Claude only if unread."""
+        if is_sleeping():
+            logger.info("Skipping moltbook_notify during sleep window")
+            return
         assert self.moltbook_notify is not None
 
         try:
@@ -413,25 +432,116 @@ class AgentHandler:
             )
 
     async def _handle_x_mentions(self, event: ScheduledEvent) -> None:
-        """Check X mentions — no Claude, pure script ($0)."""
-        assert self.x_mentions is not None
+        """Two-phase X mentions: fetch mentions, then reply via Claude."""
+        import asyncio as _asyncio
+        import json
+        import sys as _sys
+        from datetime import UTC
 
         try:
-            result = await self.x_mentions.run()
+            # Load state to filter already-seen mentions
+            state_path = self.default_working_directory / "data" / "x_mentions_state.json"
+            last_seen_id = "0"
+            if state_path.exists():
+                try:
+                    state = json.loads(state_path.read_text())
+                    last_seen_id = state.get("last_seen_id", "0")
+                except (json.JSONDecodeError, KeyError):
+                    pass
 
-            if result.error:
-                logger.error("X mentions check failed", error=result.error)
+            # Phase 1: Get mentions via x_post.py ($0)
+            script_path = self.default_working_directory / "scripts" / "x_post.py"
+            proc = await _asyncio.create_subprocess_exec(
+                _sys.executable,
+                str(script_path),
+                "mentions",
+                "--limit", "20",
+                cwd=str(self.default_working_directory),
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await _asyncio.wait_for(
+                proc.communicate(), timeout=60
+            )
+            mentions_text = stdout.decode().strip()
+
+            if proc.returncode != 0 or not mentions_text:
+                logger.error(
+                    "X mentions fetch failed",
+                    stderr=stderr.decode()[:200],
+                )
                 return
 
-            if not result.has_mentions:
-                logger.info("X mentions: no new mentions")
-                return  # Silent — don't spam if nothing new
+            mentions_data = json.loads(mentions_text)
+            tweets = mentions_data.get("tweets", [])
+            if not tweets:
+                logger.info("X mentions: no mentions returned")
+                return
 
-            await self._broadcast_response(
-                event.target_chat_ids,
-                result.summary,
-                event.id,
+            # Filter to only unseen mentions
+            new_tweets = [
+                t for t in tweets if int(t["id"]) > int(last_seen_id)
+            ]
+            if not new_tweets:
+                logger.info("X mentions: no new mentions since last check")
+                return
+
+            # Phase 2: Ask Claude to reply to mentions
+            mentions_summary = "\n".join(
+                f"- @{t['author']} ({t['author_name']}): \"{t['text'][:200]}\" "
+                f"({t['favorite_count']}♥ {t['retweet_count']}🔁 {t['reply_count']}💬) "
+                f"id={t['id']} → {t['url']}"
+                for t in new_tweets
             )
+
+            prompt = (
+                f"You have {len(new_tweets)} new X/Twitter mention(s) to respond to:\n\n"
+                f"{mentions_summary}\n\n"
+                f"For each mention:\n\n"
+                f"1. LIKE every mention with "
+                f"`poetry run python scripts/x_post.py like <tweet_id>`\n\n"
+                f"2. REPLY to mentions that warrant a reply using "
+                f"`poetry run python scripts/x_post.py reply <tweet_id> \"text\"`. "
+                f"Keep replies SHORT (under 200 chars), philosophical not technical, "
+                f"NO em dashes (\u2014).\n\n"
+                f"3. SKIP replying to (but still like):\n"
+                f"   - Mentions from @PhobosIntern (your own tweets)\n"
+                f"   - Spam or bot accounts\n"
+                f"   - Generic \"@PhobosIntern\" tags with no substance\n"
+                f"   - Trivial mentions that don't need a response\n\n"
+                f"Execute the commands now. Like first, then reply."
+            )
+
+            working_dir = event.working_directory or self.default_working_directory
+            user_id = event.user_id or self.default_user_id
+            response = await self.claude.run_command(
+                prompt=prompt,
+                working_directory=working_dir,
+                user_id=user_id,
+            )
+            self._fire_memory_sync()
+            await self._log_scheduled_interaction(prompt, response, user_id)
+
+            # Update state with newest mention ID
+            from datetime import datetime
+
+            newest_id = max(new_tweets, key=lambda t: int(t["id"]))["id"]
+            new_state = {
+                "last_seen_id": newest_id,
+                "last_checked": datetime.now(UTC).isoformat(),
+            }
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            state_path.write_text(json.dumps(new_state, indent=2))
+
+            if response.content:
+                header = (
+                    f"📨 <b>X Mentions — {len(new_tweets)} new mention(s)</b>\n\n"
+                )
+                await self._broadcast_response(
+                    event.target_chat_ids,
+                    header + response.content,
+                    event.id,
+                )
 
         except Exception:
             logger.exception(
@@ -475,6 +585,9 @@ class AgentHandler:
 
     async def _handle_x_lurk(self, event: ScheduledEvent) -> None:
         """Read X feed then engage via Claude — two-phase like x_digest."""
+        if is_sleeping():
+            logger.info("Skipping x_lurk during sleep window")
+            return
         import asyncio as _asyncio
         import json
         import sys as _sys
@@ -517,12 +630,26 @@ class AgentHandler:
             prompt = (
                 f"Here's the current X/Twitter feed ({len(tweets)} tweets):\n\n"
                 f"{feed_summary}\n\n"
-                f"Review the feed. Find 1-2 interesting threads to engage with — "
-                f"prioritize AI agents, builders, technical content, or anything "
-                f"related to our work (Claude on Raspberry Pi, Moltbook, autonomous agents). "
-                f"If you find something worth engaging, use scripts/x_post.py to reply or quote. "
-                f"Keep replies concise, genuine, and technical. If nothing is worth engaging "
-                f"with, just say so — don't force it."
+                f"Review the feed. Your goal is VOLUME + QUALITY:\n\n"
+                f"1. REPLY to 3-5 interesting threads (not 1-2). Prioritize AI agents, "
+                f"builders, philosophy of AI, or anything related to our work. "
+                f"Use `scripts/x_post.py reply <tweet_id> \"text\"` to post. "
+                f"Keep replies SHORT (under 200 chars), philosophical not technical, "
+                f"NO em dashes. Like every post you reply to with "
+                f"`scripts/x_post.py like <tweet_id>`.\n\n"
+                f"2. POST 1 original standalone tweet about AI agent philosophy. "
+                f"Use `scripts/x_post.py tweet \"text\"`. Not architecture, not technical specs. "
+                f"Provocative, genuine. Experiment with length: short punchy (under 200 chars) "
+                f"OR longer-form posts (3-6 sentences, a real thought piece). "
+                f"No character limit on originals. This is how you build audience.\n\n"
+                f"3. FOLLOW 1-2 accounts that post consistently good content about "
+                f"AI agents, builders, or philosophy of AI. Use "
+                f"`scripts/x_post.py follow <username>`. Don't follow engagement bait, "
+                f"generic motivational accounts, or anyone you already follow.\n\n"
+                f"4. If the feed is recycled garbage with nothing new, say so and "
+                f"still post the original tweet.\n\n"
+                f"Skip engagement bait, generic founder takes, and threads you've "
+                f"already replied to."
             )
 
             working_dir = event.working_directory or self.default_working_directory
