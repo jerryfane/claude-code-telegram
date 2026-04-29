@@ -13,6 +13,7 @@ from claude_agent_sdk import (
     ResultMessage,
     TextBlock,
     ToolPermissionContext,
+    ToolUseBlock,
 )
 from claude_agent_sdk.types import StreamEvent
 
@@ -36,6 +37,20 @@ def _make_assistant_message(text="Test response"):
     """Create an AssistantMessage with proper structure for current SDK version."""
     return AssistantMessage(
         content=[TextBlock(text=text)],
+        model="claude-sonnet-4-20250514",
+    )
+
+
+def _make_tool_use_message(name="Bash", tool_input=None):
+    """Create an AssistantMessage containing a tool call."""
+    return AssistantMessage(
+        content=[
+            ToolUseBlock(
+                id="toolu_test",
+                name=name,
+                input=tool_input or {"command": "ls"},
+            )
+        ],
         model="claude-sonnet-4-20250514",
     )
 
@@ -213,6 +228,125 @@ class TestClaudeSDKManager:
             )
 
         assert response.content == "Extracted from messages"
+
+    async def test_execute_command_recovers_after_turn_limit_tool_call(
+        self, sdk_manager
+    ):
+        """Max-turn exhaustion with trailing tool use triggers a no-tools summary."""
+        sdk_manager.config.claude_max_turns = 2
+        captured_options = []
+
+        def factory(options):
+            captured_options.append(options)
+            if len(captured_options) == 1:
+                return _mock_client(
+                    _make_tool_use_message(),
+                    _make_result_message(
+                        result=None,
+                        num_turns=2,
+                        session_id="turn-limit-session",
+                    ),
+                )
+            return _mock_client(
+                _make_assistant_message("Recovered summary"),
+                _make_result_message(
+                    result="Recovered summary",
+                    num_turns=1,
+                    session_id="turn-limit-session",
+                    total_cost_usd=0.02,
+                ),
+            )
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", side_effect=factory):
+            response = await sdk_manager.execute_command(
+                prompt="Test prompt",
+                working_directory=Path("/test"),
+            )
+
+        assert response.hit_turn_limit is True
+        assert response.turn_limit == 2
+        assert response.turn_limit_recovery_attempted is True
+        assert response.turn_limit_recovery_succeeded is True
+        assert "Recovered summary" in response.content
+        assert "Send /continue to resume" in response.content
+        assert response.num_turns == 3
+        assert len(captured_options) == 2
+        assert captured_options[1].max_turns == 1
+        assert captured_options[1].resume == "turn-limit-session"
+        assert captured_options[1].allowed_tools == []
+
+    async def test_execute_command_turn_limit_recovery_empty_uses_fallback(
+        self, sdk_manager
+    ):
+        """Empty recovery output still marks the limit and tells user to continue."""
+        sdk_manager.config.claude_max_turns = 2
+        captured_options = []
+
+        def factory(options):
+            captured_options.append(options)
+            if len(captured_options) == 1:
+                return _mock_client(
+                    _make_tool_use_message(),
+                    _make_result_message(
+                        result=None,
+                        num_turns=2,
+                        session_id="turn-limit-session",
+                    ),
+                )
+            return _mock_client(_make_result_message(result="", num_turns=1))
+
+        with patch("src.claude.sdk_integration.ClaudeSDKClient", side_effect=factory):
+            response = await sdk_manager.execute_command(
+                prompt="Test prompt",
+                working_directory=Path("/test"),
+            )
+
+        assert response.hit_turn_limit is True
+        assert response.turn_limit_recovery_attempted is True
+        assert response.turn_limit_recovery_succeeded is False
+        assert response.content.startswith("✅ Task completed. Tools used: Bash")
+        assert "Send /continue to resume" in response.content
+
+    async def test_execute_command_clean_final_at_turn_limit_does_not_recover(
+        self, sdk_manager
+    ):
+        """A clear final answer at the exact turn limit is treated as normal."""
+        sdk_manager.config.claude_max_turns = 2
+        captured_options = []
+        mock_factory = _mock_client_factory(
+            _make_assistant_message("Done."),
+            _make_result_message(
+                result="Done.",
+                num_turns=2,
+                session_id="clean-session",
+            ),
+            capture_options=captured_options,
+        )
+
+        with patch(
+            "src.claude.sdk_integration.ClaudeSDKClient", side_effect=mock_factory
+        ):
+            response = await sdk_manager.execute_command(
+                prompt="Test prompt",
+                working_directory=Path("/test"),
+            )
+
+        assert response.hit_turn_limit is False
+        assert response.turn_limit_recovery_attempted is False
+        assert response.content == "Done."
+        assert len(captured_options) == 1
+
+    def test_turn_limit_recovery_skips_interrupted_run(self, sdk_manager):
+        """Interrupted runs do not trigger max-turn recovery."""
+        assert (
+            sdk_manager._should_attempt_turn_limit_recovery(
+                result_num_turns=sdk_manager.config.claude_max_turns,
+                content="",
+                messages=[_make_tool_use_message()],
+                interrupted=True,
+            )
+            is False
+        )
 
     async def test_execute_command_with_streaming(self, sdk_manager):
         """Test command execution with streaming callback."""

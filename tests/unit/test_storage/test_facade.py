@@ -107,6 +107,15 @@ class TestStorageFacade:
         assert updated_session.message_count == 1
         assert updated_session.total_turns == 1
 
+        audit_logs = await storage.audit.get_user_audit_log(12347)
+        interaction_log = next(
+            log for log in audit_logs if log.event_type == "claude_interaction"
+        )
+        assert interaction_log.event_data["hit_turn_limit"] is False
+        assert interaction_log.event_data["turn_limit"] is None
+        assert interaction_log.event_data["turn_limit_recovery_attempted"] is False
+        assert interaction_log.event_data["turn_limit_recovery_succeeded"] is False
+
     async def test_is_user_allowed(self, storage):
         """Test checking user permissions."""
         # Create allowed user

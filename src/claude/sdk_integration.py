@@ -47,6 +47,19 @@ logger = structlog.get_logger()
 
 # Fallback message when Claude produces no text but did use tools.
 TASK_COMPLETED_MSG = "✅ Task completed. Tools used: {tools_summary}"
+TURN_LIMIT_NOTE = (
+    "\n\nReached the configured turn limit ({turn_limit}). "
+    "Send /continue to resume."
+)
+TURN_LIMIT_RECOVERY_PROMPT = """
+You reached the configured tool/turn limit for the previous request.
+
+Do not call any tools. Provide a concise final response for the user that
+summarizes:
+1. What you found or changed.
+2. What remains unresolved.
+3. The next concrete step if they want to continue.
+""".strip()
 
 
 # Anthropic's auto-injected memory protocol (used when memory_20250818 ships
@@ -86,6 +99,10 @@ class ClaudeResponse:
     error_type: Optional[str] = None
     tools_used: List[Dict[str, Any]] = field(default_factory=list)
     interrupted: bool = False
+    hit_turn_limit: bool = False
+    turn_limit: Optional[int] = None
+    turn_limit_recovery_attempted: bool = False
+    turn_limit_recovery_succeeded: bool = False
 
 
 @dataclass
@@ -354,6 +371,285 @@ class ClaudeSDKManager:
             return "mcp" not in msg  # "server" alone is too broad
         return False
 
+    async def _collect_client_messages(
+        self,
+        options: ClaudeAgentOptions,
+        prompt: str,
+        messages: List[Message],
+        stream_callback: Optional[Callable[[StreamUpdate], None]] = None,
+        session_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+        images: Optional[List[Dict[str, str]]] = None,
+    ) -> None:
+        """Run one SDK query and append parsed messages to ``messages``."""
+        client = ClaudeSDKClient(options)
+        try:
+            await client.connect()
+
+            if images:
+                content_blocks: List[Dict[str, Any]] = []
+                for img in images:
+                    media_type = img.get("media_type", "image/png")
+                    content_blocks.append(
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": img["data"],
+                            },
+                        }
+                    )
+                content_blocks.append({"type": "text", "text": prompt})
+
+                multimodal_msg = {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": content_blocks,
+                    },
+                }
+
+                async def _multimodal_prompt() -> AsyncIterator[Dict[str, Any]]:
+                    yield multimodal_msg
+
+                await client.query(_multimodal_prompt())
+            else:
+                await client.query(prompt)
+
+            async for raw_data in client._query.receive_messages():
+                try:
+                    message = parse_message(raw_data)
+                except MessageParseError as e:
+                    logger.debug(
+                        "Skipping unparseable message",
+                        error=str(e),
+                    )
+                    continue
+
+                messages.append(message)
+
+                if isinstance(message, ResultMessage):
+                    break
+
+                if stream_callback:
+                    try:
+                        await self._handle_stream_message(
+                            message,
+                            stream_callback,
+                            session_id=session_id,
+                            user_id=user_id,
+                        )
+                    except Exception as callback_error:
+                        logger.warning(
+                            "Stream callback failed",
+                            error=str(callback_error),
+                            error_type=type(callback_error).__name__,
+                        )
+        finally:
+            await client.disconnect()
+
+    def _assistant_has_tool_use(self, message: Message) -> bool:
+        if not isinstance(message, AssistantMessage):
+            return False
+        content = getattr(message, "content", [])
+        return isinstance(content, list) and any(
+            isinstance(block, ToolUseBlock) for block in content
+        )
+
+    def _extract_assistant_text(self, message: Message) -> str:
+        if not isinstance(message, AssistantMessage):
+            return ""
+        content = getattr(message, "content", [])
+        text_parts: List[str] = []
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, TextBlock):
+                    text_parts.append(block.text)
+                elif isinstance(block, ThinkingBlock):
+                    text_parts.append(block.thinking)
+                elif hasattr(block, "text"):
+                    text_parts.append(str(block.text))
+        elif content:
+            text_parts.append(str(content))
+        return "\n".join(part for part in text_parts if part).strip()
+
+    def _last_assistant_message(self, messages: List[Message]) -> Optional[Message]:
+        for message in reversed(messages):
+            if isinstance(message, AssistantMessage):
+                return message
+        return None
+
+    def _looks_like_incomplete_transition(self, content: str) -> bool:
+        """Heuristic for responses that end while promising another action."""
+        text = (content or "").strip()
+        if not text:
+            return True
+        lower = text.lower()
+        incomplete_suffixes = (
+            "let me check",
+            "let me check:",
+            "let me inspect",
+            "let me inspect:",
+            "let me look",
+            "let me look:",
+            "i'll check",
+            "i'll check:",
+            "i will check",
+            "i will check:",
+            "checking",
+            "checking:",
+        )
+        if lower.endswith(incomplete_suffixes):
+            return True
+        return lower.endswith(":") and any(
+            phrase in lower[-160:]
+            for phrase in (
+                "let me",
+                "i'll",
+                "i will",
+                "next",
+                "now",
+                "check",
+                "inspect",
+                "look",
+            )
+        )
+
+    def _should_attempt_turn_limit_recovery(
+        self,
+        *,
+        result_num_turns: Optional[int],
+        content: str,
+        messages: List[Message],
+        interrupted: bool,
+    ) -> bool:
+        """Return True when the SDK likely stopped because max_turns was hit."""
+        if interrupted:
+            return False
+        turn_limit = self.config.claude_max_turns
+        if result_num_turns is None or result_num_turns < turn_limit:
+            return False
+
+        last_assistant = self._last_assistant_message(messages)
+        if last_assistant is not None and self._assistant_has_tool_use(last_assistant):
+            return True
+
+        if not content.strip():
+            return True
+
+        if content.startswith("✅ Task completed. Tools used:"):
+            return True
+
+        return self._looks_like_incomplete_transition(content)
+
+    async def _attempt_turn_limit_recovery(
+        self,
+        base_options: ClaudeAgentOptions,
+        session_id: str,
+    ) -> tuple[str, float, int, Optional[str]]:
+        """Ask Claude for one no-tools final summary after max_turn exhaustion."""
+
+        def _make_recovery_options(
+            *,
+            allowed_tools: Optional[List[str]],
+            disallowed_tools: Optional[List[str]],
+        ) -> ClaudeAgentOptions:
+            recovery_options = ClaudeAgentOptions(
+                max_turns=1,
+                model=getattr(base_options, "model", None),
+                max_budget_usd=getattr(base_options, "max_budget_usd", None),
+                cwd=getattr(base_options, "cwd", None),
+                allowed_tools=allowed_tools,  # type: ignore[arg-type]
+                disallowed_tools=disallowed_tools,  # type: ignore[arg-type]
+                cli_path=getattr(base_options, "cli_path", None),
+                include_partial_messages=False,
+                sandbox=getattr(base_options, "sandbox", None),
+                system_prompt=getattr(base_options, "system_prompt", None),
+                setting_sources=getattr(base_options, "setting_sources", None),
+                stderr=getattr(base_options, "stderr", None),
+            )
+            recovery_options.resume = session_id
+            recovery_options.mcp_servers = getattr(base_options, "mcp_servers", {})
+            can_use_tool = getattr(base_options, "can_use_tool", None)
+            if can_use_tool is not None:
+                recovery_options.can_use_tool = can_use_tool
+            return recovery_options
+
+        attempts: List[ClaudeAgentOptions] = [
+            _make_recovery_options(allowed_tools=[], disallowed_tools=None)
+        ]
+
+        # Fallback for SDK/CLI versions that do not accept an empty allow-list:
+        # disallow every configured tool instead.
+        configured_tools = list(self.config.claude_allowed_tools or [])
+        if configured_tools:
+            attempts.append(
+                _make_recovery_options(
+                    allowed_tools=None,
+                    disallowed_tools=configured_tools,
+                )
+            )
+
+        last_error: Optional[BaseException] = None
+        for recovery_options in attempts:
+            recovery_messages: List[Message] = []
+            try:
+                await self._collect_client_messages(
+                    options=recovery_options,
+                    prompt=TURN_LIMIT_RECOVERY_PROMPT,
+                    messages=recovery_messages,
+                    stream_callback=None,
+                    session_id=session_id,
+                )
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Turn-limit recovery query failed",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    used_empty_allow_list=getattr(
+                        recovery_options, "allowed_tools", None
+                    )
+                    == [],
+                )
+                continue
+
+            cost = 0.0
+            num_turns = 0
+            recovery_session_id: Optional[str] = None
+            result_content: Optional[str] = None
+            for message in recovery_messages:
+                if isinstance(message, ResultMessage):
+                    cost = getattr(message, "total_cost_usd", 0.0) or 0.0
+                    recovery_session_id = getattr(message, "session_id", None)
+                    result_content = getattr(message, "result", None)
+                    num_turns = getattr(message, "num_turns", 0) or 0
+                    break
+
+            if result_content is not None:
+                content = str(result_content).strip()
+            else:
+                parts = [
+                    self._extract_assistant_text(msg)
+                    for msg in recovery_messages
+                    if isinstance(msg, AssistantMessage)
+                ]
+                content = "\n".join(part for part in parts if part).strip()
+
+            if content:
+                return content, cost, num_turns, recovery_session_id
+
+        if last_error is not None:
+            raise last_error
+        return "", 0.0, 0, None
+
+    def _append_turn_limit_note(self, content: str) -> str:
+        note = TURN_LIMIT_NOTE.format(turn_limit=self.config.claude_max_turns)
+        if note.strip() in content:
+            return content
+        return (content or "").rstrip() + note
+
     async def execute_command(
         self,
         prompt: str,
@@ -513,75 +809,6 @@ class ClaudeSDKManager:
             messages: List[Message] = []
             interrupted = False
 
-            async def _run_client() -> None:
-                client = ClaudeSDKClient(options)
-                try:
-                    await client.connect()
-
-                    if images:
-                        content_blocks: List[Dict[str, Any]] = []
-                        for img in images:
-                            media_type = img.get("media_type", "image/png")
-                            content_blocks.append(
-                                {
-                                    "type": "image",
-                                    "source": {
-                                        "type": "base64",
-                                        "media_type": media_type,
-                                        "data": img["data"],
-                                    },
-                                }
-                            )
-                        content_blocks.append({"type": "text", "text": prompt})
-
-                        multimodal_msg = {
-                            "type": "user",
-                            "message": {
-                                "role": "user",
-                                "content": content_blocks,
-                            },
-                        }
-
-                        async def _multimodal_prompt() -> AsyncIterator[Dict[str, Any]]:
-                            yield multimodal_msg
-
-                        await client.query(_multimodal_prompt())
-                    else:
-                        await client.query(prompt)
-
-                    async for raw_data in client._query.receive_messages():
-                        try:
-                            message = parse_message(raw_data)
-                        except MessageParseError as e:
-                            logger.debug(
-                                "Skipping unparseable message",
-                                error=str(e),
-                            )
-                            continue
-
-                        messages.append(message)
-
-                        if isinstance(message, ResultMessage):
-                            break
-
-                        # Handle streaming callback
-                        if stream_callback:
-                            try:
-                                await self._handle_stream_message(
-                                    message,
-                                    stream_callback,
-                                    session_id=session_id,
-                                    user_id=user_id,
-                                )
-                            except Exception as callback_error:
-                                logger.warning(
-                                    "Stream callback failed",
-                                    error=str(callback_error),
-                                    error_type=type(callback_error).__name__,
-                                )
-                finally:
-                    await client.disconnect()
-
             # Execute with timeout and retry, racing against optional interrupt
             max_attempts = max(1, self.config.claude_retry_max_attempts)
             last_exc: Optional[BaseException] = None
@@ -589,8 +816,8 @@ class ClaudeSDKManager:
             for attempt in range(max_attempts):
                 # Reset message accumulator each attempt so that a failed attempt
                 # does not pollute the next one with partial/duplicate messages.
-                # _run_client() closes over `messages` by reference (late-binding
-                # closure), so clearing it here is seen by every new call.
+                # The collector appends into `messages`, so each retry starts
+                # from a clean accumulator.
                 messages.clear()
 
                 if attempt > 0:
@@ -607,7 +834,17 @@ class ClaudeSDKManager:
                     )
                     await asyncio.sleep(delay)
 
-                run_task = asyncio.create_task(_run_client())
+                run_task = asyncio.create_task(
+                    self._collect_client_messages(
+                        options=options,
+                        prompt=prompt,
+                        messages=messages,
+                        stream_callback=stream_callback,
+                        session_id=session_id,
+                        user_id=user_id,
+                        images=images,
+                    )
+                )
 
                 interrupt_watcher: Optional["asyncio.Task[None]"] = None
                 if interrupt_event is not None:
@@ -666,11 +903,13 @@ class ClaudeSDKManager:
             tools_used: List[Dict[str, Any]] = []
             claude_session_id = None
             result_content = None
+            result_num_turns: Optional[int] = None
             for message in messages:
                 if isinstance(message, ResultMessage):
                     cost = getattr(message, "total_cost_usd", 0.0) or 0.0
                     claude_session_id = getattr(message, "session_id", None)
                     result_content = getattr(message, "result", None)
+                    result_num_turns = getattr(message, "num_turns", None)
                     current_time = asyncio.get_event_loop().time()
                     for msg in messages:
                         if isinstance(msg, AssistantMessage):
@@ -701,9 +940,6 @@ class ClaudeSDKManager:
                             session_id=claude_session_id,
                         )
                         break
-
-            # Calculate duration
-            duration_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
 
             # Use Claude's session_id if available, otherwise fall back
             final_session_id = claude_session_id or session_id or ""
@@ -741,6 +977,62 @@ class ClaudeSDKManager:
                 tools_summary = ", ".join(unique_tool_names) or "unknown"
                 content = TASK_COMPLETED_MSG.format(tools_summary=tools_summary)
 
+            hit_turn_limit = self._should_attempt_turn_limit_recovery(
+                result_num_turns=result_num_turns,
+                content=content,
+                messages=messages,
+                interrupted=interrupted,
+            )
+            recovery_attempted = False
+            recovery_succeeded = False
+
+            if hit_turn_limit:
+                logger.warning(
+                    "Claude likely hit max_turns",
+                    session_id=final_session_id,
+                    turn_limit=self.config.claude_max_turns,
+                    result_num_turns=result_num_turns,
+                    has_session_id=bool(final_session_id),
+                )
+                if final_session_id:
+                    recovery_attempted = True
+                    try:
+                        recovery_content, recovery_cost, recovery_turns, recovery_id = (
+                            await self._attempt_turn_limit_recovery(
+                                base_options=options,
+                                session_id=final_session_id,
+                            )
+                        )
+                        cost += recovery_cost
+                        if recovery_turns:
+                            result_num_turns = (result_num_turns or 0) + recovery_turns
+                        if recovery_id and recovery_id != final_session_id:
+                            logger.info(
+                                "Turn-limit recovery returned session ID",
+                                recovery_session_id=recovery_id,
+                                original_session_id=final_session_id,
+                            )
+                        if recovery_content:
+                            content = recovery_content
+                            recovery_succeeded = True
+                    except Exception as recovery_error:
+                        logger.warning(
+                            "Turn-limit recovery failed",
+                            session_id=final_session_id,
+                            error=str(recovery_error),
+                            error_type=type(recovery_error).__name__,
+                        )
+                else:
+                    logger.warning(
+                        "Skipping turn-limit recovery because session_id is missing"
+                    )
+
+                content = self._append_turn_limit_note(content)
+
+            # Calculate duration after any recovery attempt so telemetry includes
+            # the full user-visible request.
+            duration_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
+
             # Publish final response to dashboard
             await self._publish_dashboard_event(
                 event_kind="RESPONSE",
@@ -754,7 +1046,9 @@ class ClaudeSDKManager:
                 session_id=final_session_id,
                 cost=cost,
                 duration_ms=duration_ms,
-                num_turns=len(
+                num_turns=result_num_turns
+                if result_num_turns is not None
+                else len(
                     [
                         m
                         for m in messages
@@ -763,6 +1057,10 @@ class ClaudeSDKManager:
                 ),
                 tools_used=tools_used,
                 interrupted=interrupted,
+                hit_turn_limit=hit_turn_limit,
+                turn_limit=self.config.claude_max_turns if hit_turn_limit else None,
+                turn_limit_recovery_attempted=recovery_attempted,
+                turn_limit_recovery_succeeded=recovery_succeeded,
             )
 
         except asyncio.TimeoutError:

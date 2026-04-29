@@ -141,6 +141,14 @@ class Storage:
                 "num_turns": response.num_turns,
                 "is_error": response.is_error,
                 "tools_used": [t["name"] for t in response.tools_used],
+                "hit_turn_limit": response.hit_turn_limit,
+                "turn_limit": response.turn_limit,
+                "turn_limit_recovery_attempted": (
+                    response.turn_limit_recovery_attempted
+                ),
+                "turn_limit_recovery_succeeded": (
+                    response.turn_limit_recovery_succeeded
+                ),
             },
             success=not response.is_error,
             timestamp=datetime.now(UTC),
