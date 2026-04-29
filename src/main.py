@@ -207,7 +207,12 @@ async def create_application(config: Settings) -> Dict[str, Any]:
     # Code agent service — spawns claude CLI sub-agents
     code_agent_service = CodeAgentService(
         working_directory=config.approved_directory,
-        cli_path=str(config.claude_cli_path) if config.claude_cli_path else "/home/pi/.local/bin/claude",
+        cli_path=(
+            str(config.claude_cli_path)
+            if config.claude_cli_path
+            else "/home/pi/.local/bin/claude"
+        ),
+        model=config.claude_model,
     )
 
     # Memory sync service — event-driven push after Claude writes
@@ -216,7 +221,9 @@ async def create_application(config: Settings) -> Dict[str, Any]:
         memory_sync_service = MemorySyncService(
             memory_dir=config.resolved_memory_dir,
         )
-        logger.info("Memory sync service enabled", memory_dir=str(config.resolved_memory_dir))
+        logger.info(
+            "Memory sync service enabled", memory_dir=str(config.resolved_memory_dir)
+        )
 
     # Agent handler — translates events into Claude executions
     agent_handler = AgentHandler(

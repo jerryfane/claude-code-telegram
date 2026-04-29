@@ -2708,6 +2708,37 @@ class MessageOrchestrator:
         activity_log: list[str] = []
         last_edit_time: list[float] = [0]
 
+        async def _send_code_agent_message(
+            text: str,
+            *,
+            parse_mode: Optional[str] = None,
+            message_thread_id: Optional[int] = None,
+        ) -> None:
+            kwargs: dict = {}
+            if message_thread_id:
+                kwargs["message_thread_id"] = message_thread_id
+            try:
+                await chat.send_message(text, parse_mode=parse_mode, **kwargs)
+            except Exception as send_error:
+                logger.warning(
+                    "Failed to send code agent message",
+                    chat_id=chat_id,
+                    thread_id=message_thread_id,
+                    parse_mode=parse_mode,
+                    error=str(send_error),
+                )
+                if parse_mode is None:
+                    return
+                try:
+                    await chat.send_message(text, **kwargs)
+                except Exception as fallback_error:
+                    logger.warning(
+                        "Failed to send code agent fallback message",
+                        chat_id=chat_id,
+                        thread_id=message_thread_id,
+                        error=str(fallback_error),
+                    )
+
         def _format_tool_line(block: dict) -> str:
             name = block.get("name", "?")
             inp = block.get("input", {})
@@ -2746,21 +2777,22 @@ class MessageOrchestrator:
                 icon = "❌" if is_error else "✅"
                 header = f"{icon} <b>Done</b> — ${cost:.4f}, {turns} turns\n\n"
 
-                msg_kwargs: dict = {}
-                if message_thread_id:
-                    msg_kwargs["message_thread_id"] = message_thread_id
-
                 # Send result in 4000-char chunks
-                full_text = header + escape_html(result)
-                try:
-                    for i in range(0, len(full_text), 4000):
-                        chunk = full_text[i : i + 4000]
-                        parse = "HTML" if i == 0 else None
-                        await chat.send_message(chunk, parse_mode=parse, **msg_kwargs)
-                        if i + 4000 < len(full_text):
-                            await asyncio.sleep(0.5)
-                except Exception:
-                    logger.debug("Failed to send code agent result")
+                result = str(result)
+                chunks = [
+                    result[i : i + 3800] for i in range(0, len(result), 3800)
+                ] or [""]
+                for idx, chunk in enumerate(chunks):
+                    text = escape_html(chunk)
+                    if idx == 0:
+                        text = header + text
+                    await _send_code_agent_message(
+                        text,
+                        parse_mode="HTML",
+                        message_thread_id=message_thread_id,
+                    )
+                    if idx < len(chunks) - 1:
+                        await asyncio.sleep(0.5)
 
                 # Don't auto-close topic — let Jerry review and close manually
                 return
@@ -2782,24 +2814,26 @@ class MessageOrchestrator:
                 recent_lines = activity_log[-3:]
                 text = "\n".join(recent_lines)
                 if text.strip():
-                    try:
-                        await chat.send_message(
-                            text[:4000],
-                            message_thread_id=message_thread_id,
-                        )
-                    except Exception:
-                        pass
+                    await _send_code_agent_message(
+                        text[:4000],
+                        message_thread_id=message_thread_id,
+                    )
             else:
                 # Private: self-edit the status message
                 recent = activity_log[-10:]
                 status_text = (
                     f"🤖 <b>Code Agent</b> ({mode_label} mode)\n"
-                    f"Task: {escape_html(task[:100])}\n\n" + "\n".join(recent)
+                    f"Task: {escape_html(task[:100])}\n\n"
+                    + escape_html("\n".join(recent))
                 )
                 try:
                     await initial_msg.edit_text(status_text[:4000], parse_mode="HTML")
-                except Exception:
-                    pass
+                except Exception as edit_error:
+                    logger.warning(
+                        "Failed to edit code agent status",
+                        chat_id=chat_id,
+                        error=str(edit_error),
+                    )
 
         # Spawn the session
         try:
@@ -2808,6 +2842,7 @@ class MessageOrchestrator:
                 chat_id=chat_id,
                 output_callback=_output_callback,
                 permission_mode=permission_mode,
+                model=self.settings.claude_model,
             )
             session.message_thread_id = message_thread_id
         except Exception as e:

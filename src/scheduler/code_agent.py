@@ -14,12 +14,16 @@ from typing import Any, Callable, Coroutine, Dict, Optional
 
 import structlog
 
+from src.bot.utils.html_format import escape_html
+
 logger = structlog.get_logger()
 
 # Defaults
 DEFAULT_MAX_BUDGET = 0.50  # USD per invocation
 DEFAULT_MAX_DURATION = 300  # seconds
 DEFAULT_CLI_PATH = "/home/pi/.local/bin/claude"
+SUBPROCESS_STREAM_LIMIT = 4 * 1024 * 1024
+DIAGNOSTIC_TAIL_LIMIT = 8000
 
 
 class CodeAgentSession:
@@ -53,10 +57,15 @@ class CodeAgentSession:
         self.total_cost: float = 0
         self.num_turns: int = 0
         self.result_text: str = ""
+        self.stderr_tail: str = ""
+        self.non_json_stdout_tail: str = ""
 
         self._process: Optional[asyncio.subprocess.Process] = None
         self._read_task: Optional[asyncio.Task] = None
+        self._stderr_task: Optional[asyncio.Task] = None
         self._timeout_task: Optional[asyncio.Task] = None
+        self._saw_result = False
+        self._final_event_sent = False
 
     async def start(self) -> None:
         """Spawn the claude CLI with stream-json I/O."""
@@ -80,13 +89,19 @@ class CodeAgentSession:
         cmd = [
             self.cli_path,
             "-p",
-            "--output-format", "stream-json",
-            "--input-format", "stream-json",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
             "--verbose",
-            "--permission-mode", self.permission_mode,
-            "--max-budget-usd", str(self.max_budget),
-            "--system-prompt", system_prompt,
-            "--setting-sources", "",
+            "--permission-mode",
+            self.permission_mode,
+            "--max-budget-usd",
+            str(self.max_budget),
+            "--system-prompt",
+            system_prompt,
+            "--setting-sources",
+            "",
             # Task sent via stdin, not as CLI arg (required for stream-json input)
         ]
 
@@ -107,6 +122,7 @@ class CodeAgentSession:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=SUBPROCESS_STREAM_LIMIT,
         )
 
         self.started_at = datetime.now(UTC)
@@ -114,6 +130,7 @@ class CodeAgentSession:
 
         # Start background readers
         self._read_task = asyncio.create_task(self._read_output_loop())
+        self._stderr_task = asyncio.create_task(self._read_stderr_loop())
         self._timeout_task = asyncio.create_task(self._timeout_watchdog())
 
         # Send the task as the first user message
@@ -126,13 +143,18 @@ class CodeAgentSession:
         if self.status != "running":
             return False
 
-        msg = json.dumps({
-            "type": "user",
-            "message": {
-                "role": "user",
-                "content": [{"type": "text", "text": text}],
-            },
-        }) + "\n"
+        msg = (
+            json.dumps(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": text}],
+                    },
+                }
+            )
+            + "\n"
+        )
         try:
             self._process.stdin.write(msg.encode())
             await self._process.stdin.drain()
@@ -147,20 +169,105 @@ class CodeAgentSession:
         if self._process and self.status == "running":
             self.status = "killed"
             self.finished_at = datetime.now(UTC)
-            try:
-                self._process.terminate()
-                await asyncio.wait_for(self._process.wait(), timeout=5)
-            except (asyncio.TimeoutError, ProcessLookupError):
-                try:
-                    self._process.kill()
-                except ProcessLookupError:
-                    pass
+            await self._terminate_process()
             logger.info("Code agent killed", session_id=self.session_id)
 
         if self._read_task and not self._read_task.done():
             self._read_task.cancel()
+        if self._stderr_task and not self._stderr_task.done():
+            self._stderr_task.cancel()
         if self._timeout_task and not self._timeout_task.done():
             self._timeout_task.cancel()
+
+    def _append_tail(self, attr: str, text: str) -> None:
+        """Append diagnostic text while retaining only the last N characters."""
+        current = getattr(self, attr)
+        current = (current + text)[-DIAGNOSTIC_TAIL_LIMIT:]
+        setattr(self, attr, current)
+
+    async def _terminate_process(self) -> None:
+        """Terminate the subprocess regardless of session status."""
+        if not self._process:
+            return
+        if self._process.returncode is not None:
+            return
+        try:
+            self._process.terminate()
+            await asyncio.wait_for(self._process.wait(), timeout=5)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            try:
+                self._process.kill()
+                await self._process.wait()
+            except ProcessLookupError:
+                pass
+
+    async def _emit_callback(self, data: Dict[str, Any]) -> None:
+        """Forward an event to Telegram callback and log delivery failures."""
+        try:
+            await self.output_callback(data)
+        except Exception as e:
+            logger.warning(
+                "Code agent output callback failed",
+                session_id=self.session_id,
+                event_type=data.get("type"),
+                error=str(e),
+                exc_info=True,
+            )
+
+    def _diagnostic_result(
+        self, title: str, returncode: Optional[int]
+    ) -> Dict[str, Any]:
+        """Build a synthetic result event for exits without a real result."""
+        parts = [title]
+        if returncode is not None:
+            parts.append(f"Exit code: {returncode}")
+        if self.stderr_tail.strip():
+            parts.append("stderr tail:\n" + self.stderr_tail.strip()[-2000:])
+        if self.non_json_stdout_tail.strip():
+            parts.append(
+                "non-JSON stdout tail:\n" + self.non_json_stdout_tail.strip()[-2000:]
+            )
+        if len(parts) == 1:
+            parts.append("No result event was emitted by the Claude CLI.")
+
+        return {
+            "type": "result",
+            "subtype": "code_agent_diagnostic",
+            "is_error": True,
+            "result": "\n\n".join(parts),
+            "total_cost_usd": self.total_cost,
+            "num_turns": self.num_turns,
+        }
+
+    async def _emit_missing_result_if_needed(
+        self,
+        title: str,
+        returncode: Optional[int] = None,
+    ) -> None:
+        """Send a synthetic final result when Claude exits without one."""
+        if self._final_event_sent:
+            return
+        self._final_event_sent = True
+        await self._emit_callback(self._diagnostic_result(title, returncode))
+
+    async def _read_stderr_loop(self) -> None:
+        """Drain stderr so the subprocess cannot block and retain diagnostics."""
+        assert self._process and self._process.stderr
+
+        try:
+            while True:
+                chunk = await self._process.stderr.read(4096)
+                if not chunk:
+                    break
+                text = chunk.decode(errors="replace")
+                self._append_tail("stderr_tail", text)
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception(
+                "Code agent stderr reader failed",
+                session_id=self.session_id,
+            )
 
     async def _read_output_loop(self) -> None:
         """Read stream-json lines from stdout and forward to callback."""
@@ -179,12 +286,20 @@ class CodeAgentSession:
                 try:
                     data = json.loads(line_str)
                 except json.JSONDecodeError:
+                    self._append_tail("non_json_stdout_tail", line_str + "\n")
+                    logger.warning(
+                        "Code agent emitted non-JSON stdout",
+                        session_id=self.session_id,
+                        line=line_str[:500],
+                    )
                     continue
 
                 msg_type = data.get("type", "")
 
                 # Extract result info (but keep session alive for multi-turn)
                 if msg_type == "result":
+                    self._saw_result = True
+                    self._final_event_sent = True
                     self.total_cost = data.get("total_cost_usd", 0)
                     self.num_turns = data.get("num_turns", 0)
                     self.result_text = data.get("result", "")[:2000]
@@ -192,20 +307,54 @@ class CodeAgentSession:
                     # Session ends when: process exits (EOF), kill(), or timeout
 
                 # Forward to callback (Telegram delivery)
-                try:
-                    await self.output_callback(data)
-                except Exception:
-                    logger.debug("Output callback error", exc_info=True)
+                await self._emit_callback(data)
 
         except asyncio.CancelledError:
             pass
-        except Exception:
-            logger.exception("Code agent output reader failed")
+        except Exception as e:
+            logger.exception(
+                "Code agent output reader failed",
+                session_id=self.session_id,
+            )
+            await self._emit_missing_result_if_needed(
+                f"Code agent output reader failed: {type(e).__name__}"
+            )
         finally:
-            # Ensure status is set
+            returncode = None
+            if self._process:
+                try:
+                    returncode = await self._process.wait()
+                except Exception:
+                    logger.exception(
+                        "Failed waiting for code agent process",
+                        session_id=self.session_id,
+                    )
+                    returncode = self._process.returncode
+
+            if self._stderr_task and not self._stderr_task.done():
+                try:
+                    await asyncio.wait_for(self._stderr_task, timeout=1)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    self._stderr_task.cancel()
+
             if self.status == "running":
-                self.status = "completed"
+                if self._saw_result and returncode in (0, None):
+                    self.status = "completed"
+                else:
+                    self.status = "failed"
+                    await self._emit_missing_result_if_needed(
+                        "Code agent exited before emitting a final result.",
+                        returncode=returncode,
+                    )
                 self.finished_at = datetime.now(UTC)
+
+            if self._saw_result and returncode not in (0, None):
+                logger.warning(
+                    "Code agent exited nonzero after emitting result",
+                    session_id=self.session_id,
+                    returncode=returncode,
+                    stderr_tail=self.stderr_tail[-1000:],
+                )
             if self._timeout_task and not self._timeout_task.done():
                 self._timeout_task.cancel()
 
@@ -219,13 +368,12 @@ class CodeAgentSession:
                     session_id=self.session_id,
                     max_duration=self.max_duration,
                 )
+                await self._emit_missing_result_if_needed(
+                    f"Code agent timed out after {self.max_duration}s."
+                )
                 self.status = "failed"
-                await self.output_callback({
-                    "type": "system",
-                    "subtype": "timeout",
-                    "message": f"Code agent timed out after {self.max_duration}s",
-                })
-                await self.kill()
+                self.finished_at = datetime.now(UTC)
+                await self._terminate_process()
         except asyncio.CancelledError:
             pass
 
@@ -240,7 +388,11 @@ class CodeAgentSession:
 class CodeAgentService:
     """Manages active code agent sessions. One session per chat."""
 
-    PENDING_FILE = Path(__file__).resolve().parent.parent.parent / "data" / "pending_code_tasks.json"
+    PENDING_FILE = (
+        Path(__file__).resolve().parent.parent.parent
+        / "data"
+        / "pending_code_tasks.json"
+    )
 
     def __init__(
         self,
@@ -248,11 +400,13 @@ class CodeAgentService:
         cli_path: str = DEFAULT_CLI_PATH,
         max_budget: float = DEFAULT_MAX_BUDGET,
         max_duration: int = DEFAULT_MAX_DURATION,
+        model: Optional[str] = None,
     ) -> None:
         self.working_directory = working_directory
         self.cli_path = cli_path
         self.max_budget = max_budget
         self.max_duration = max_duration
+        self.model = model
         self.active_sessions: Dict[int, CodeAgentSession] = {}
         self._bot: Any = None  # Telegram Bot instance, set via set_bot()
         self._is_forum: Dict[int, bool] = {}  # chat_id -> is_forum
@@ -284,7 +438,7 @@ class CodeAgentService:
             permission_mode=permission_mode,
             max_budget=self.max_budget,
             max_duration=self.max_duration,
-            model=model,
+            model=model if model is not None else self.model,
         )
         self.active_sessions[chat_id] = session
         await session.start()
@@ -304,7 +458,9 @@ class CodeAgentService:
             await session.kill()
             return True
 
-    async def process_pending_tasks(self, override_chat_id: Optional[int] = None) -> int:
+    async def process_pending_tasks(
+        self, override_chat_id: Optional[int] = None
+    ) -> int:
         """Pick up pending code tasks written by scripts/code_task.py.
 
         Called as fire-and-forget after each Claude response.
@@ -335,7 +491,9 @@ class CodeAgentService:
 
                 # Skip if session already running for this chat
                 if self.get_session(chat_id):
-                    logger.warning("Code agent already running for chat", chat_id=chat_id)
+                    logger.warning(
+                        "Code agent already running for chat", chat_id=chat_id
+                    )
                     continue
 
                 permission_mode = "acceptEdits" if mode == "build" else "plan"
@@ -363,7 +521,7 @@ class CodeAgentService:
                     chat_id=chat_id,
                     text=(
                         f"🤖 <b>Code Agent</b> ({mode_label} mode)\n"
-                        f"Task: {task[:200]}\n\n"
+                        f"Task: {escape_html(task[:200])}\n\n"
                         f"<i>Spawned by Phobos. Reply to steer. /code kill to stop.</i>"
                     ),
                     **send_kwargs,
@@ -371,14 +529,60 @@ class CodeAgentService:
 
                 # Build output callback
                 import time as _time
+
                 activity_log: list = []
                 last_edit_time = [0.0]
                 bot = self._bot
 
+                async def _send_with_fallback(
+                    *,
+                    chat_id: int,
+                    text: str,
+                    parse_mode: Optional[str] = None,
+                    message_thread_id: Optional[int] = None,
+                ) -> None:
+                    kwargs: Dict[str, Any] = {}
+                    if message_thread_id:
+                        kwargs["message_thread_id"] = message_thread_id
+                    try:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=text,
+                            parse_mode=parse_mode,
+                            **kwargs,
+                        )
+                    except Exception as html_error:
+                        logger.warning(
+                            "Code agent Telegram send failed",
+                            chat_id=chat_id,
+                            thread_id=message_thread_id,
+                            parse_mode=parse_mode,
+                            error=str(html_error),
+                        )
+                        if parse_mode is None:
+                            return
+                        try:
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text=text,
+                                **kwargs,
+                            )
+                        except Exception as plain_error:
+                            logger.warning(
+                                "Code agent Telegram fallback send failed",
+                                chat_id=chat_id,
+                                thread_id=message_thread_id,
+                                error=str(plain_error),
+                            )
+
                 async def _make_callback(
-                    _chat_id: int, _thread_id: Optional[int],
-                    _initial_msg: Any, _activity: list, _last_edit: list,
-                    _mode_label: str, _task: str,
+                    _chat_id: int,
+                    _thread_id: Optional[int],
+                    _initial_msg: Any,
+                    _activity: list,
+                    _last_edit: list,
+                    _mode_label: str,
+                    _task: str,
                 ) -> Callable:
                     async def _cb(data: dict) -> None:
                         msg_type = data.get("type", "")
@@ -389,9 +593,19 @@ class CodeAgentService:
                                     name = block.get("name", "?")
                                     inp = block.get("input", {})
                                     if name == "Bash":
-                                        _activity.append(f"⚡ Bash: {inp.get('command','?')[:80]}")
-                                    elif name in ("Read", "Edit", "Write", "Glob", "Grep"):
-                                        _activity.append(f"🔧 {name} {inp.get('file_path', inp.get('pattern','?'))[:60]}")
+                                        _activity.append(
+                                            f"⚡ Bash: {inp.get('command','?')[:80]}"
+                                        )
+                                    elif name in (
+                                        "Read",
+                                        "Edit",
+                                        "Write",
+                                        "Glob",
+                                        "Grep",
+                                    ):
+                                        _activity.append(
+                                            f"🔧 {name} {inp.get('file_path', inp.get('pattern','?'))[:60]}"
+                                        )
                                     else:
                                         _activity.append(f"🔧 {name}")
                                 elif block.get("type") == "text":
@@ -405,18 +619,24 @@ class CodeAgentService:
                             turns = data.get("num_turns", 0)
                             is_error = data.get("is_error", False)
                             icon = "❌" if is_error else "✅"
-                            header = f"{icon} <b>Done</b> — ${cost:.4f}, {turns} turns\n\n"
-                            full = header + result
-                            kw: Dict[str, Any] = {}
-                            if _thread_id:
-                                kw["message_thread_id"] = _thread_id
-                            for i in range(0, len(full), 4000):
-                                chunk = full[i:i+4000]
-                                parse = "HTML" if i == 0 else None
-                                try:
-                                    await bot.send_message(chat_id=_chat_id, text=chunk, parse_mode=parse, **kw)
-                                except Exception:
-                                    pass
+                            header = (
+                                f"{icon} <b>Done</b> — ${cost:.4f}, {turns} turns\n\n"
+                            )
+                            result = str(result)
+                            chunks = [
+                                result[i : i + 3800]
+                                for i in range(0, len(result), 3800)
+                            ] or [""]
+                            for idx, chunk in enumerate(chunks):
+                                text = escape_html(chunk)
+                                if idx == 0:
+                                    text = header + text
+                                await _send_with_fallback(
+                                    chat_id=_chat_id,
+                                    text=text,
+                                    parse_mode="HTML",
+                                    message_thread_id=_thread_id,
+                                )
                             return
 
                         else:
@@ -431,23 +651,42 @@ class CodeAgentService:
                             recent = _activity[-3:]
                             text = "\n".join(recent)
                             if text.strip():
-                                try:
-                                    await bot.send_message(chat_id=_chat_id, text=text[:4000], message_thread_id=_thread_id)
-                                except Exception:
-                                    pass
+                                await _send_with_fallback(
+                                    chat_id=_chat_id,
+                                    text=text[:4000],
+                                    message_thread_id=_thread_id,
+                                )
                         else:
                             recent = _activity[-10:]
-                            status = f"🤖 <b>Code Agent</b> ({_mode_label})\nTask: {_task[:100]}\n\n" + "\n".join(recent)
+                            status = (
+                                f"🤖 <b>Code Agent</b> ({_mode_label})\n"
+                                f"Task: {escape_html(_task[:100])}\n\n"
+                                + escape_html("\n".join(recent))
+                            )
                             try:
-                                await bot.edit_message_text(text=status[:4000], chat_id=_chat_id, message_id=_initial_msg.message_id, parse_mode="HTML")
-                            except Exception:
-                                pass
+                                await bot.edit_message_text(
+                                    text=status[:4000],
+                                    chat_id=_chat_id,
+                                    message_id=_initial_msg.message_id,
+                                    parse_mode="HTML",
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "Code agent Telegram edit failed",
+                                    chat_id=_chat_id,
+                                    error=str(e),
+                                )
 
                     return _cb
 
                 callback = await _make_callback(
-                    chat_id, message_thread_id, initial_msg,
-                    activity_log, last_edit_time, mode_label, task,
+                    chat_id,
+                    message_thread_id,
+                    initial_msg,
+                    activity_log,
+                    last_edit_time,
+                    mode_label,
+                    task,
                 )
 
                 session = await self.spawn(
@@ -458,7 +697,11 @@ class CodeAgentService:
                 )
                 session.message_thread_id = message_thread_id
                 spawned += 1
-                logger.info("Spawned code agent from pending task", task=task[:60], chat_id=chat_id)
+                logger.info(
+                    "Spawned code agent from pending task",
+                    task=task[:60],
+                    chat_id=chat_id,
+                )
 
             except Exception:
                 logger.exception("Failed to process pending code task")
