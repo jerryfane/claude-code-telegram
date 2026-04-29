@@ -54,11 +54,27 @@ class ClaudeCodeBot:
         builder.defaults(Defaults(do_quote=self.settings.reply_quote))
         builder.rate_limiter(AIORateLimiter(max_retries=1))
 
+        from .update_processor import StopAwareUpdateProcessor
+
+        builder.concurrent_updates(StopAwareUpdateProcessor())
+
         # Configure connection settings
         builder.connect_timeout(30)
         builder.read_timeout(30)
         builder.write_timeout(30)
         builder.pool_timeout(30)
+
+        # Explicitly set proxy from environment variables.
+        # This is necessary because python-telegram-bot's Application.builder()
+        # does not automatically use HTTP_PROXY/HTTPS_PROXY environment variables.
+        # Without this, the httpx connection pool can become corrupted when running
+        # behind a proxy, causing the bot to stop responding to messages.
+        import os
+
+        proxy_url = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+        if proxy_url:
+            builder.proxy(proxy_url)
+            logger.info("Proxy configured", proxy=proxy_url)
 
         self.app = builder.build()
 

@@ -82,8 +82,8 @@ def deps():
     }
 
 
-def test_agentic_registers_6_commands(agentic_settings, deps):
-    """Agentic mode registers start, new, status, verbose, repo, restart commands."""
+def test_agentic_registers_10_commands(agentic_settings, deps):
+    """Agentic mode registers all supported slash commands."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     app = MagicMock()
     app.add_handler = MagicMock()
@@ -100,7 +100,7 @@ def test_agentic_registers_6_commands(agentic_settings, deps):
     ]
     commands = [h[0][0].commands for h in cmd_handlers]
 
-    assert len(cmd_handlers) == 7
+    assert len(cmd_handlers) == 10
     assert frozenset({"start"}) in commands
     assert frozenset({"new"}) in commands
     assert frozenset({"status"}) in commands
@@ -108,6 +108,9 @@ def test_agentic_registers_6_commands(agentic_settings, deps):
     assert frozenset({"repo"}) in commands
     assert frozenset({"restart"}) in commands
     assert frozenset({"cron"}) in commands
+    assert frozenset({"moltbook"}) in commands
+    assert frozenset({"code"}) in commands
+    assert frozenset({"help"}) in commands
 
 
 def test_classic_registers_14_commands(classic_settings, deps):
@@ -150,20 +153,31 @@ def test_agentic_registers_text_document_photo_handlers(agentic_settings, deps):
         if isinstance(call[0][0], CallbackQueryHandler)
     ]
 
-    # 4 message handlers (text, document, photo, voice)
-    assert len(msg_handlers) == 4
-    # 1 callback handler (for cd: only)
-    assert len(cb_handlers) == 1
+    # 5 message handlers (text, document, photo, voice, unknown commands passthrough)
+    assert len(msg_handlers) == 5
+    # 2 callback handlers (stop: + cd:)
+    assert len(cb_handlers) == 2
 
 
 async def test_agentic_bot_commands(agentic_settings, deps):
-    """Agentic mode returns 6 bot commands."""
+    """Agentic mode returns all supported bot commands."""
     orchestrator = MessageOrchestrator(agentic_settings, deps)
     commands = await orchestrator.get_bot_commands()
 
-    assert len(commands) == 7
+    assert len(commands) == 10
     cmd_names = [c.command for c in commands]
-    assert cmd_names == ["start", "new", "status", "verbose", "repo", "restart", "cron"]
+    assert cmd_names == [
+        "start",
+        "new",
+        "status",
+        "verbose",
+        "repo",
+        "restart",
+        "cron",
+        "moltbook",
+        "code",
+        "help",
+    ]
 
 
 async def test_classic_bot_commands(classic_settings, deps):
@@ -339,10 +353,14 @@ async def test_agentic_callback_scoped_to_cd_pattern(agentic_settings, deps):
         if isinstance(call[0][0], CallbackQueryHandler)
     ]
 
-    assert len(cb_handlers) == 1
-    # The pattern attribute should match cd: prefixed data
-    assert cb_handlers[0].pattern is not None
-    assert cb_handlers[0].pattern.match("cd:my_project")
+    assert len(cb_handlers) == 2
+    # Find the cd: handler by pattern
+    cd_handler = [h for h in cb_handlers if h.pattern and h.pattern.match("cd:x")]
+    assert len(cd_handler) == 1
+    assert cd_handler[0].pattern.match("cd:my_project")
+    # Also has a stop: handler
+    stop_handler = [h for h in cb_handlers if h.pattern and h.pattern.match("stop:1")]
+    assert len(stop_handler) == 1
 
 
 async def test_agentic_document_rejects_large_files(agentic_settings, deps):
@@ -927,3 +945,63 @@ async def test_private_mode_rejects_help_outside_topics(private_thread_settings,
 
     assert called["value"] is False
     update.effective_message.reply_text.assert_called_once()
+
+
+async def test_known_command_not_forwarded_to_claude(agentic_settings, deps):
+    """Known commands must NOT be forwarded to agentic_text."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    app = MagicMock()
+    app.add_handler = MagicMock()
+    orchestrator.register_handlers(app)
+
+    update = MagicMock()
+    update.effective_message.text = "/start"
+    context = MagicMock()
+
+    with patch.object(
+        orchestrator, "agentic_text", new_callable=AsyncMock
+    ) as mock_claude:
+        await orchestrator._handle_unknown_command(update, context)
+        mock_claude.assert_not_called()
+
+
+async def test_unknown_command_forwarded_to_claude(agentic_settings, deps):
+    """Unknown slash commands must be forwarded to agentic_text."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    app = MagicMock()
+    app.add_handler = MagicMock()
+    orchestrator.register_handlers(app)
+
+    update = MagicMock()
+    update.effective_message.text = "/workflow activate job-hunter"
+    context = MagicMock()
+
+    with patch.object(
+        orchestrator, "agentic_text", new_callable=AsyncMock
+    ) as mock_claude:
+        await orchestrator._handle_unknown_command(update, context)
+        mock_claude.assert_called_once_with(update, context)
+
+
+async def test_bot_suffixed_command_not_forwarded(agentic_settings, deps):
+    """Bot-suffixed known commands like /start@mybot must not reach Claude."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    orchestrator = MessageOrchestrator(agentic_settings, deps)
+    app = MagicMock()
+    app.add_handler = MagicMock()
+    orchestrator.register_handlers(app)
+
+    update = MagicMock()
+    update.effective_message.text = "/start@mybot"
+    context = MagicMock()
+
+    with patch.object(
+        orchestrator, "agentic_text", new_callable=AsyncMock
+    ) as mock_claude:
+        await orchestrator._handle_unknown_command(update, context)
+        mock_claude.assert_not_called()

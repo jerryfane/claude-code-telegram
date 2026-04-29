@@ -8,6 +8,7 @@ classic mode, delegates to existing full-featured handlers.
 import asyncio
 import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -41,6 +42,13 @@ from .utils.image_extractor import (
 from .utils.reply_context import extract_reply_context
 
 logger = structlog.get_logger()
+
+_MEDIA_TYPE_MAP = {
+    "png": "image/png",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "webp": "image/webp",
+}
 
 # Patterns that look like secrets/credentials in CLI arguments
 _SECRET_PATTERNS: List[re.Pattern[str]] = [
@@ -110,12 +118,24 @@ def _tool_icon(name: str) -> str:
     return _TOOL_ICONS.get(name, "\U0001f527")
 
 
+@dataclass
+class ActiveRequest:
+    """Tracks an in-flight Claude request so it can be interrupted."""
+
+    user_id: int
+    interrupt_event: asyncio.Event = field(default_factory=asyncio.Event)
+    interrupted: bool = False
+    progress_msg: Any = None  # telegram Message object
+
+
 class MessageOrchestrator:
     """Routes messages based on mode. Single entry point for all Telegram updates."""
 
     def __init__(self, settings: Settings, deps: Dict[str, Any]):
         self.settings = settings
         self.deps = deps
+        self._active_requests: Dict[int, ActiveRequest] = {}
+        self._known_commands: frozenset[str] = frozenset()
 
     def _inject_deps(self, handler: Callable) -> Callable:  # type: ignore[type-arg]
         """Wrap handler to inject dependencies into context.bot_data."""
@@ -317,6 +337,9 @@ class MessageOrchestrator:
         if self.settings.enable_project_threads:
             handlers.append(("sync_threads", command.sync_threads))
 
+        # Derive known commands dynamically — avoids drift when new commands are added
+        self._known_commands: frozenset[str] = frozenset(cmd for cmd, _ in handlers)
+
         for cmd, handler in handlers:
             app.add_handler(CommandHandler(cmd, self._inject_deps(handler)))
 
@@ -325,6 +348,19 @@ class MessageOrchestrator:
             MessageHandler(
                 filters.TEXT & ~filters.COMMAND,
                 self._inject_deps(self.agentic_text),
+            ),
+            group=10,
+        )
+
+        # Unknown slash commands -> Claude (passthrough in agentic mode).
+        # Registered commands are handled by CommandHandlers in group 0
+        # (higher priority). This catches any /command not matched there
+        # and forwards it to Claude, while skipping known commands to
+        # avoid double-firing.
+        app.add_handler(
+            MessageHandler(
+                filters.COMMAND,
+                self._inject_deps(self._handle_unknown_command),
             ),
             group=10,
         )
@@ -347,6 +383,14 @@ class MessageOrchestrator:
         app.add_handler(
             MessageHandler(filters.VOICE, self._inject_deps(self.agentic_voice)),
             group=10,
+        )
+
+        # Stop button callback (must be before cd: handler)
+        app.add_handler(
+            CallbackQueryHandler(
+                self._inject_deps(self._handle_stop_callback),
+                pattern=r"^stop:",
+            )
         )
 
         # Only cd: callbacks (for project selection), scoped by pattern
@@ -684,9 +728,11 @@ class MessageOrchestrator:
         progress_msg: Any,
         tool_log: List[Dict[str, Any]],
         start_time: float,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
         mcp_images: Optional[List[ImageAttachment]] = None,
         approved_directory: Optional[Path] = None,
         draft_streamer: Optional[DraftStreamer] = None,
+        interrupt_event: Optional[asyncio.Event] = None,
     ) -> Optional[Callable[[StreamUpdate], Any]]:
         """Create a stream callback for verbose progress updates.
 
@@ -710,6 +756,10 @@ class MessageOrchestrator:
         last_edit_time = [0.0]  # mutable container for closure
 
         async def _on_stream(update_obj: StreamUpdate) -> None:
+            # Stop all streaming activity after interrupt
+            if interrupt_event is not None and interrupt_event.is_set():
+                return
+
             # Intercept send_image_to_user MCP tool calls.
             # The SDK namespaces MCP tools as "mcp__<server>__<tool>",
             # so match both the bare name and the namespaced variant.
@@ -774,7 +824,9 @@ class MessageOrchestrator:
                         tool_log, verbose_level, start_time
                     )
                     try:
-                        await progress_msg.edit_text(new_text)
+                        await progress_msg.edit_text(
+                            new_text, reply_markup=reply_markup
+                        )
                     except Exception:
                         pass
 
@@ -890,13 +942,17 @@ class MessageOrchestrator:
                     is_code_agent_msg = True
             elif update.message.reply_to_message:
                 # Private chat mode: reply to the code agent's status message
-                if update.message.reply_to_message.message_id == thread_info.get("message_id"):
+                if update.message.reply_to_message.message_id == thread_info.get(
+                    "message_id"
+                ):
                     is_code_agent_msg = True
 
         if is_code_agent_msg:
             from ..scheduler.code_agent import CodeAgentService
 
-            svc_ca: Optional["CodeAgentService"] = context.bot_data.get("code_agent_service")
+            svc_ca: Optional["CodeAgentService"] = context.bot_data.get(
+                "code_agent_service"
+            )
             if svc_ca:
                 session = svc_ca.get_session(chat_id)
                 if session and session.status == "running":
@@ -968,12 +1024,30 @@ class MessageOrchestrator:
         await chat.send_action("typing")
 
         verbose_level = self._get_verbose_level(context)
-        progress_msg = await update.message.reply_text("Working...")
+
+        # Create Stop button and interrupt event
+        interrupt_event = asyncio.Event()
+        stop_kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Stop", callback_data=f"stop:{user_id}")]]
+        )
+        progress_msg = await update.message.reply_text(
+            "Working...", reply_markup=stop_kb
+        )
+
+        # Register active request for stop callback
+        active_request = ActiveRequest(
+            user_id=user_id,
+            interrupt_event=interrupt_event,
+            progress_msg=progress_msg,
+        )
+        self._active_requests[user_id] = active_request
 
         claude_integration = context.bot_data.get("claude_integration")
         if not claude_integration:
+            self._active_requests.pop(user_id, None)
             await progress_msg.edit_text(
-                "Claude integration not available. Check configuration."
+                "Claude integration not available. Check configuration.",
+                reply_markup=None,
             )
             return
 
@@ -1007,9 +1081,11 @@ class MessageOrchestrator:
             progress_msg,
             tool_log,
             start_time,
+            reply_markup=stop_kb,
             mcp_images=mcp_images,
             approved_directory=self.settings.approved_directory,
             draft_streamer=draft_streamer,
+            interrupt_event=interrupt_event,
         )
 
         # Independent typing heartbeat — stays alive even with no stream events
@@ -1024,6 +1100,7 @@ class MessageOrchestrator:
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
+                interrupt_event=interrupt_event,
             )
 
             # Fire-and-forget memory sync + reminder pickup (non-blocking)
@@ -1035,9 +1112,11 @@ class MessageOrchestrator:
                 asyncio.create_task(reminder_svc.process_pending())
             code_svc = context.bot_data.get("code_agent_service")
             if code_svc:
-                asyncio.create_task(code_svc.process_pending_tasks(
-                    override_chat_id=update.effective_chat.id
-                ))
+                asyncio.create_task(
+                    code_svc.process_pending_tasks(
+                        override_chat_id=update.effective_chat.id
+                    )
+                )
 
             # New session created successfully — clear the one-shot flag
             if force_new:
@@ -1070,9 +1149,14 @@ class MessageOrchestrator:
             from .utils.formatting import ResponseFormatter
 
             formatter = ResponseFormatter(self.settings)
-            formatted_messages = formatter.format_claude_response(
-                claude_response.content
-            )
+
+            response_content = claude_response.content
+            if claude_response.interrupted:
+                response_content = (
+                    response_content or ""
+                ) + "\n\n_(Interrupted by user)_"
+
+            formatted_messages = formatter.format_claude_response(response_content)
 
         except Exception as e:
             success = False
@@ -1085,6 +1169,7 @@ class MessageOrchestrator:
             ]
         finally:
             heartbeat.cancel()
+            self._active_requests.pop(user_id, None)
             if draft_streamer:
                 try:
                     await draft_streamer.flush()
@@ -1331,9 +1416,11 @@ class MessageOrchestrator:
                 asyncio.create_task(reminder_svc.process_pending())
             code_svc = context.bot_data.get("code_agent_service")
             if code_svc:
-                asyncio.create_task(code_svc.process_pending_tasks(
-                    override_chat_id=update.effective_chat.id
-                ))
+                asyncio.create_task(
+                    code_svc.process_pending_tasks(
+                        override_chat_id=update.effective_chat.id
+                    )
+                )
 
             if force_new:
                 context.user_data["force_new_session"] = False
@@ -1442,30 +1529,14 @@ class MessageOrchestrator:
             processed_image = await image_handler.process_image(
                 photo, update.message.caption
             )
-
-            # Save image to disk so Claude can read it with its Read tool
-            import base64
-
-            image_bytes = base64.b64decode(processed_image.base64_data)
-            current_dir = context.user_data.get(
-                "current_directory", self.settings.approved_directory
-            )
-            img_format = (
-                processed_image.metadata.get("format", "png")
-                if processed_image.metadata
-                else "png"
-            )
-            image_path = self._save_image_to_working_dir(
-                image_bytes, current_dir, img_format
-            )
-
-            caption = update.message.caption or ""
-            caption_part = f"\n\nUser's message: {caption}" if caption else ""
-            prompt = (
-                f"I've shared an image with you. It has been saved to "
-                f"`{image_path}`. Use your Read tool to view and analyze it."
-                f"{caption_part}"
-            )
+            fmt = (processed_image.metadata or {}).get("format", "png")
+            images = [
+                {
+                    "data": processed_image.base64_data,
+                    "media_type": _MEDIA_TYPE_MAP.get(fmt, "image/png"),
+                }
+            ]
+            prompt = processed_image.prompt
 
             # Prepend quoted message context when replying to a previous message
             reply_context = extract_reply_context(update.message)
@@ -1479,6 +1550,7 @@ class MessageOrchestrator:
                 progress_msg=progress_msg,
                 user_id=user_id,
                 chat=chat,
+                images=images,
             )
 
         except Exception as e:
@@ -1549,6 +1621,7 @@ class MessageOrchestrator:
         progress_msg: Any,
         user_id: int,
         chat: Any,
+        images: Optional[List[Dict[str, str]]] = None,
     ) -> None:
         """Run a media-derived prompt through Claude and send responses."""
         claude_integration = context.bot_data.get("claude_integration")
@@ -1585,6 +1658,7 @@ class MessageOrchestrator:
                 session_id=session_id,
                 on_stream=on_stream,
                 force_new=force_new,
+                images=images,
             )
         finally:
             heartbeat.cancel()
@@ -1598,9 +1672,11 @@ class MessageOrchestrator:
             asyncio.create_task(reminder_svc.process_pending())
         code_svc = context.bot_data.get("code_agent_service")
         if code_svc:
-            asyncio.create_task(code_svc.process_pending_tasks(
-                override_chat_id=update.effective_chat.id
-            ))
+            asyncio.create_task(
+                code_svc.process_pending_tasks(
+                    override_chat_id=update.effective_chat.id
+                )
+            )
 
         if force_new:
             context.user_data["force_new_session"] = False
@@ -1708,8 +1784,33 @@ class MessageOrchestrator:
         filepath.write_bytes(image_bytes)
         return str(filepath)
 
+    async def _handle_unknown_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Forward unknown slash commands to Claude in agentic mode.
+
+        Known commands are handled by their own CommandHandlers (group 0);
+        this handler fires for *every* COMMAND message in group 10 but
+        returns immediately when the command is registered, preventing
+        double execution.
+        """
+        msg = update.effective_message
+        if not msg or not msg.text:
+            return
+        cmd = msg.text.split()[0].lstrip("/").split("@")[0].lower()
+        if cmd in self._known_commands:
+            return  # let the registered CommandHandler take care of it
+        # Forward unrecognised /commands to Claude as natural language
+        await self.agentic_text(update, context)
+
     def _voice_unavailable_message(self) -> str:
         """Return provider-aware guidance when voice feature is unavailable."""
+        if self.settings.voice_provider == "local":
+            return (
+                "Voice processing is not available. "
+                "Ensure whisper.cpp is installed and the model file exists. "
+                "Check WHISPER_CPP_BINARY_PATH and WHISPER_CPP_MODEL_PATH settings."
+            )
         return (
             "Voice processing is not available. "
             f"Set {self.settings.voice_provider_api_key_env} "
@@ -2226,9 +2327,7 @@ class MessageOrchestrator:
         """Run X/Twitter digest search and show raw results (no Claude)."""
         from ..scheduler.x_digest import XDigestService
 
-        x_digest: Optional[XDigestService] = context.bot_data.get(
-            "x_digest_service"
-        )
+        x_digest: Optional[XDigestService] = context.bot_data.get("x_digest_service")
         if not x_digest:
             await update.message.reply_text("XDigestService is not available.")
             return
@@ -2339,7 +2438,11 @@ class MessageOrchestrator:
         ]
         for n in result.notifications[:10]:
             ntype = n.get("type", "?")
-            agent = n.get("from_agent", {}).get("name", "?") if isinstance(n.get("from_agent"), dict) else "?"
+            agent = (
+                n.get("from_agent", {}).get("name", "?")
+                if isinstance(n.get("from_agent"), dict)
+                else "?"
+            )
             lines.append(f"• [{ntype}] from @{escape_html(agent)}")
         lines.append("\nA real run would invoke Claude to reply to these.")
         await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -2476,7 +2579,7 @@ class MessageOrchestrator:
             "/moltbook stats — Show post performance\n"
             "\n"
             "<b>Code Agent</b>\n"
-            '/code &lt;task&gt; — Spawn sub-agent (plan mode, read-only)\n'
+            "/code &lt;task&gt; — Spawn sub-agent (plan mode, read-only)\n"
             "/code --build &lt;task&gt; — Spawn sub-agent (can edit files)\n"
             "/code status — Show active session\n"
             "/code kill — Terminate active session\n"
@@ -2503,8 +2606,8 @@ class MessageOrchestrator:
         if not args:
             await update.message.reply_text(
                 "<b>Usage:</b>\n"
-                '<code>/code &lt;task&gt;</code> — spawn sub-agent (plan mode)\n'
-                '<code>/code --build &lt;task&gt;</code> — spawn sub-agent (can edit files)\n'
+                "<code>/code &lt;task&gt;</code> — spawn sub-agent (plan mode)\n"
+                "<code>/code --build &lt;task&gt;</code> — spawn sub-agent (can edit files)\n"
                 "<code>/code status</code> — show active session\n"
                 "<code>/code kill</code> — terminate active session",
                 parse_mode="HTML",
@@ -2691,13 +2794,10 @@ class MessageOrchestrator:
                 recent = activity_log[-10:]
                 status_text = (
                     f"🤖 <b>Code Agent</b> ({mode_label} mode)\n"
-                    f"Task: {escape_html(task[:100])}\n\n"
-                    + "\n".join(recent)
+                    f"Task: {escape_html(task[:100])}\n\n" + "\n".join(recent)
                 )
                 try:
-                    await initial_msg.edit_text(
-                        status_text[:4000], parse_mode="HTML"
-                    )
+                    await initial_msg.edit_text(status_text[:4000], parse_mode="HTML")
                 except Exception:
                     pass
 
@@ -2712,6 +2812,37 @@ class MessageOrchestrator:
             session.message_thread_id = message_thread_id
         except Exception as e:
             await update.message.reply_text(f"Failed to spawn code agent: {e}")
+
+    async def _handle_stop_callback(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """Handle stop: callbacks — interrupt a running Claude request."""
+        query = update.callback_query
+        target_user_id = int(query.data.split(":", 1)[1])
+
+        # Only the requesting user can stop their own request
+        if query.from_user.id != target_user_id:
+            await query.answer(
+                "Only the requesting user can stop this.", show_alert=True
+            )
+            return
+
+        active = self._active_requests.get(target_user_id)
+        if not active:
+            await query.answer("Already completed.", show_alert=False)
+            return
+        if active.interrupted:
+            await query.answer("Already stopping...", show_alert=False)
+            return
+
+        active.interrupt_event.set()
+        active.interrupted = True
+        await query.answer("Stopping...", show_alert=False)
+
+        try:
+            await active.progress_msg.edit_text("Stopping...", reply_markup=None)
+        except Exception:
+            pass
 
     async def _agentic_callback(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE

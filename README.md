@@ -194,7 +194,7 @@ Enable with `ENABLE_API_SERVER=true` and `ENABLE_SCHEDULER=true`. See [docs/setu
 - Directory sandboxing with path traversal prevention
 - File upload handling with archive extraction
 - Image/screenshot upload with analysis
-- Voice message transcription (Mistral Voxtral / OpenAI Whisper)
+- Voice message transcription (Mistral Voxtral / OpenAI Whisper / [local whisper.cpp](docs/local-whisper-cpp.md))
 - Git integration with safe repository operations
 - Quick actions system with context-aware buttons
 - Session export in Markdown, HTML, and JSON formats
@@ -335,6 +335,7 @@ make test          # Run tests with coverage
 make lint          # Black + isort + flake8 + mypy
 make format        # Auto-format code
 make run-debug     # Run with debug logging
+make run-watch     # Run with auto-restart on code changes
 ```
 
 > **Full documentation:** See the [docs index](docs/README.md) for all guides and references.
