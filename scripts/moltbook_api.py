@@ -114,7 +114,7 @@ SUB_WORDS = {
     "drops", "decelerates", "slower", "decreases",
     "lose", "lost",
 }
-MUL_WORDS = {"times", "product", "multiplied", "multiplies", "impulse"}
+MUL_WORDS = {"times", "product", "multiplied", "multiplies", "multiply", "impulse"}
 DIV_WORDS = {"divided", "over", "split", "halved"}
 
 # Physics keyword phrases that imply specific operations
@@ -127,12 +127,18 @@ PHYSICS_PHRASES: dict[str, str] = {
 MULTI_WORD_OPS: dict[str, list[str]] = {
     "*": ["scaled by", "multiplied by"],
     "/": ["divided by", "split by"],
-    "+": ["speeds up", "adds up", "goes up", "moves up", "powers up"],
-    "-": ["slows down", "goes down", "drops by", "falls by", "net force"],
+    "+": ["speeds up", "adds up", "goes up", "moves up", "powers up", "ends up by", "up by"],
+    "-": ["slows down", "goes down", "drops by", "falls by", "net force", "loses by", "reduced by", "decreases by", "dropped by"],
 }
 
 # Nouns that make a preceding number a descriptor, not an operand
 # "one claw" = descriptor, "twenty three" = operand
+# Mid-sentence correction markers — "adds thirty? noo wait sry: sixteen"
+CORRECTION_MARKERS = {
+    "wait", "sry", "sorry", "actually", "oops", "scratch",
+    "noo", "err", "errr", "erm", "uhh", "hmm",
+}
+
 DESCRIPTOR_NOUNS = {
     "claw", "claws", "hand", "hands", "arm", "arms",
     "side", "sides", "leg", "legs", "eye", "eyes",
@@ -210,7 +216,7 @@ _TEEN_MISSPELLINGS: dict[str, str] = {
 }
 
 
-def _fuzzy_match_number_word(word: str) -> Optional[str]:
+def _fuzzy_match_number_word(word: str, require_first_char: bool = True) -> Optional[str]:
     """Fuzzy-match a mangled word against known number words.
 
     After deobfuscation+dedup, compound number second words can get mangled:
@@ -221,6 +227,9 @@ def _fuzzy_match_number_word(word: str) -> Optional[str]:
     2. Check teen misspelling table
     3. Try edit-distance-1 matches against number words
     4. Try substring containment heuristics
+
+    If require_first_char=True, only match targets whose first char matches the word's first char.
+    This prevents phantom matches like 'terr' -> 'zero'.
     """
     if word in _ALL_NUMBER_WORDS:
         return word
@@ -234,13 +243,16 @@ def _fuzzy_match_number_word(word: str) -> Optional[str]:
     best_match: Optional[str] = None
     best_dist = 999
     for target in all_targets:
+        if require_first_char and word and target and word[0] != target[0]:
+            continue
         d = _edit_distance(word, target)
         if d < best_dist:
             best_dist = d
             best_match = target
 
-    # Accept edit distance <= 2 for words of length >= 4, <= 1 for shorter
-    max_dist = 2 if len(word) >= 4 else 1
+    # Accept edit distance <= 1 only — distance 2 causes false positives
+    # ("force" -> "forty", "reef" -> number words, etc.)
+    max_dist = 1
     if best_dist <= max_dist and best_match:
         return best_match
 
@@ -380,9 +392,6 @@ def _dedup_chars(word: str) -> Optional[str]:
         if word[j] == word[j + 1]:
             repeat_positions.append(j + 1)  # Index of the duplicate
 
-    if not repeat_positions:
-        return None
-
     # Only attempt dedup on words longer than the shortest known word they
     # could match — skip short words like "plus", "five" to avoid over-reduction.
     # Strategy: try removing chars that appear consecutively OR that create a
@@ -406,21 +415,40 @@ def _dedup_chars(word: str) -> Optional[str]:
         if not candidates:
             break
 
+    # 1.5. Single-char deletion — try removing ANY one character (handles
+    # non-consecutive insertions like "losoes" -> "loses", "fifve" -> "five")
+    if len(word) >= 4:
+        for j in range(len(word)):
+            reduced = word[:j] + word[j + 1:]
+            if reduced in _KNOWN_WORDS:
+                return reduced
+
     # 2. Suffix/prefix trimming — remove chars from ends (handles "newtonss")
+    # Don't strip meaningful short words as prefixes ("to"+"seven" must stay
+    # separate so "from X to Y" pattern is preserved)
+    _PRESERVE_PREFIXES = {
+        "to", "at", "by", "in", "on", "up", "is", "it", "an", "or",
+        "no", "if", "so", "do", "we", "he", "me", "my", "be", "of",
+        "as", "am", "go",
+    }
     for trim in range(1, min(4, len(word) - 2)):
         # Trim from end
         trimmed = word[:-trim]
         if trimmed in _KNOWN_WORDS:
             return trimmed
-        # Trim from start
-        trimmed = word[trim:]
-        if trimmed in _KNOWN_WORDS:
-            return trimmed
+        # Trim from start (only if prefix is junk, not a real word)
+        prefix_part = word[:trim]
+        if prefix_part not in _PRESERVE_PREFIXES and prefix_part not in _KNOWN_WORDS:
+            trimmed = word[trim:]
+            if trimmed in _KNOWN_WORDS:
+                return trimmed
 
     # 3. Fuzzy match against number words (Bug 1: handles mangled second words)
-    fuzzy = _fuzzy_match_number_word(word)
-    if fuzzy:
-        return fuzzy
+    # Only for words >= 3 chars — 2-char words produce false positives ("to"->"two")
+    if len(word) >= 3:
+        fuzzy = _fuzzy_match_number_word(word)
+        if fuzzy:
+            return fuzzy
 
     # 4. Check teen misspelling table directly
     if word in _TEEN_MISSPELLINGS:
@@ -443,6 +471,10 @@ def _merge_fragments(text: str) -> str:
         merged = False
         # Try merging up to 4 adjacent tokens (handles extreme splits like "t h r e e")
         for span in range(min(5, len(tokens) - i), 1, -1):
+            # Skip multi-token merges if any individual token is already known
+            # ("five" + "cms" should not merge — "five" stands alone)
+            if span > 1 and any(t in _KNOWN_WORDS for t in tokens[i : i + span]):
+                continue
             candidate = "".join(tokens[i : i + span])
             if candidate in _KNOWN_WORDS:
                 result.append(candidate)
@@ -594,6 +626,11 @@ def _detect_operator(text: str) -> Optional[str]:
     """
     lower = text.lower()
 
+    # "from NUMBER to NUMBER" pattern = subtraction (e.g. "from twenty five to seven")
+    if re.search(r"\bfrom\b\s+\w+(?:\s+\w+){0,3}\s+to\b", lower):
+        _log("Detected 'from X to Y' pattern -> subtraction")
+        return "-"
+
     # Bug #2: Physics keyword detection before normal operator extraction
     for phrase, op in PHYSICS_PHRASES.items():
         if phrase in lower:
@@ -723,6 +760,18 @@ def solve_verification(challenge_text: str) -> Optional[str]:
     if len(numbers) >= 2:
         numbers = _filter_descriptor_numbers(numbers, cleaned)
         _log(f"After descriptor filter: {numbers}")
+
+    # Handle mid-sentence corrections ("adds thirty? wait sry: sixteen")
+    # If correction markers present and 3+ numbers, the middle number(s)
+    # were "corrected" — use first and last.
+    if len(numbers) >= 3:
+        words_set = set(cleaned.lower().split())
+        if words_set & CORRECTION_MARKERS:
+            _log(
+                f"Correction markers detected in text, "
+                f"using first ({numbers[0]}) and last ({numbers[-1]})"
+            )
+            numbers = [numbers[0], numbers[-1]]
 
     if len(numbers) < 2:
         _log(f"Found only {len(numbers)} numbers in: {cleaned}")

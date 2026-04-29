@@ -160,3 +160,13 @@ ecosystem.config.js
 # Frontend
 node_modules/
 website/frontend/dist/
+# Auto-generated from vite.config.ts / TS incremental build cache
+website/frontend/vite.config.js
+website/frontend/vite.config.d.ts
+website/frontend/*.tsbuildinfo
+
+# Personal scripts (browser DevTools snippets, etc.)
+scripts/export_x_cookies.js
+
+# Entmoot / social network invite tokens
+phobos-invite.json

@@ -394,7 +394,7 @@ async def cmd_quote(args: argparse.Namespace) -> None:
     screen_name = await _get_screen_name()
 
     result = await _run_with_retry(
-        lambda: client.create_tweet(text=text, quote_tweet_id=args.tweet_id),
+        lambda: client.create_tweet(text=text, attachment_url=f"https://x.com/i/status/{args.tweet_id}"),
         is_write=True,
     )
     client.save_cookies(str(COOKIES_PATH))
