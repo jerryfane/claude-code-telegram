@@ -31,6 +31,7 @@ from claude_agent_sdk.types import StreamEvent
 from ..config.settings import Settings
 from ..events.bus import EventBus
 from ..events.types import DashboardStreamEvent
+from ..memory import make_memory_server
 from ..security.validators import SecurityValidator
 from .exceptions import (
     ClaudeMCPError,
@@ -41,6 +42,30 @@ from .exceptions import (
 from .monitor import _is_claude_internal_path, check_bash_directory_boundary
 
 logger = structlog.get_logger()
+
+
+# Anthropic's auto-injected memory protocol (used when memory_20250818 ships
+# via the raw API). The Agent SDK doesn't auto-inject this, so we append it to
+# the system prompt whenever we wire the in-process memory server.
+MEMORY_PROTOCOL_PROMPT = """
+# Memory Protocol
+
+IMPORTANT: ALWAYS VIEW YOUR MEMORY DIRECTORY BEFORE DOING ANYTHING ELSE FOR \
+A NON-TRIVIAL REQUEST.
+
+You have a memory store at /memories/, accessed via tools named \
+mcp__memory__view, mcp__memory__create, mcp__memory__str_replace, \
+mcp__memory__insert, mcp__memory__delete, and mcp__memory__rename.
+
+1. Use `mcp__memory__view` with path /memories to check for earlier progress.
+2. Work on the task; record load-bearing facts (preferences, decisions, \
+project context) in memory as you go.
+3. Keep /memories/MEMORY.md as a short index pointing to deeper files in \
+/memories/people/, /memories/projects/, /memories/topics/, /memories/decisions/.
+
+ASSUME INTERRUPTION: Your context window or session may reset at any moment, \
+so anything not recorded in /memories/ is lost.
+""".strip()
 
 
 @dataclass
@@ -257,14 +282,47 @@ class ClaudeSDKManager:
                     memory_length=len(memory_prompt),
                 )
 
+            # Build the per-user in-process memory MCP server. Each invocation
+            # gets a fresh closure capturing this user's memory directory, so
+            # concurrent users stay isolated. Skipped if no memory_dir or no
+            # user_id (e.g. anonymous webhook flows).
+            memory_server = None
+            memory_base_dir: Optional[Path] = None
+            resolved_memory_dir = self.config.resolved_memory_dir
+            if resolved_memory_dir and user_id is not None:
+                memory_base_dir = (
+                    resolved_memory_dir / "users" / str(user_id) / "memory"
+                )
+                memory_server = make_memory_server(str(user_id), memory_base_dir)
+                base_prompt += "\n\n" + MEMORY_PROTOCOL_PROMPT
+                logger.info(
+                    "Memory tool enabled",
+                    user_id=user_id,
+                    memory_base_dir=str(memory_base_dir),
+                )
+
             # When DISABLE_TOOL_VALIDATION=true, pass None for allowed/disallowed
             # tools so the SDK does not restrict tool usage (e.g. MCP tools).
             if self.config.disable_tool_validation:
                 sdk_allowed_tools = None
                 sdk_disallowed_tools = None
             else:
-                sdk_allowed_tools = self.config.claude_allowed_tools
+                sdk_allowed_tools = list(self.config.claude_allowed_tools or [])
                 sdk_disallowed_tools = self.config.claude_disallowed_tools
+                if memory_server is not None:
+                    # Add the memory tool names so the SDK doesn't deny them.
+                    # Tool names follow mcp__{server_name}__{tool_name} format.
+                    for cmd in (
+                        "view",
+                        "create",
+                        "str_replace",
+                        "insert",
+                        "delete",
+                        "rename",
+                    ):
+                        name = f"mcp__memory__{cmd}"
+                        if name not in sdk_allowed_tools:
+                            sdk_allowed_tools.append(name)
 
             # Build Claude Agent options
             options = ClaudeAgentOptions(
@@ -272,8 +330,8 @@ class ClaudeSDKManager:
                 model=self.config.claude_model or None,
                 max_budget_usd=self.config.claude_max_cost_per_request,
                 cwd=str(working_directory),
-                allowed_tools=sdk_allowed_tools,
-                disallowed_tools=sdk_disallowed_tools,
+                allowed_tools=sdk_allowed_tools,  # type: ignore[arg-type]
+                disallowed_tools=sdk_disallowed_tools,  # type: ignore[arg-type]
                 cli_path=self.config.claude_cli_path or None,
                 include_partial_messages=stream_callback is not None,
                 sandbox={
@@ -286,13 +344,22 @@ class ClaudeSDKManager:
                 stderr=_stderr_callback,
             )
 
-            # Pass MCP server configuration if enabled
+            # Pass MCP server configuration if enabled (file-based config)
+            mcp_servers: Dict[str, Any] = {}
             if self.config.enable_mcp and self.config.mcp_config_path:
-                options.mcp_servers = self._load_mcp_config(self.config.mcp_config_path)
+                mcp_servers.update(self._load_mcp_config(self.config.mcp_config_path))
                 logger.info(
                     "MCP servers configured",
                     mcp_config_path=str(self.config.mcp_config_path),
                 )
+
+            # Merge in-process memory server (per-user, captures user's base_dir
+            # via closure). Always set on options if any servers exist.
+            if memory_server is not None:
+                mcp_servers["memory"] = memory_server
+
+            if mcp_servers:
+                options.mcp_servers = mcp_servers
 
             # Wire can_use_tool callback for preventive tool validation
             if self.security_validator:
