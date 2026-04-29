@@ -25,7 +25,9 @@ import os
 import re
 import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from twikit import Client
 from twikit.errors import (
@@ -48,6 +50,45 @@ TRANSACTION_CACHE_PATH = DATA_DIR / "x_transaction.json"
 TRANSACTION_CACHE_TTL = 3600
 MAX_TWEET_LENGTH = 280
 WRITE_DELAY = 3  # Seconds between write operations to avoid anti-bot detection
+
+
+class CurlCffiHttpAdapter:
+    """Drop-in replacement for twikit's httpx.AsyncClient.
+
+    Uses curl_cffi with Chrome TLS impersonation to bypass Cloudflare's
+    JA3/JA4 fingerprint blocking that rejects httpx on residential proxies.
+    """
+
+    def __init__(self, proxy: str | None = None) -> None:
+        from curl_cffi.requests import AsyncSession
+
+        self._session = AsyncSession(impersonate="chrome120", proxy=proxy)
+        # Dummy _mounts dict for twikit's proxy getter/setter (not used at runtime)
+        self._mounts: dict[Any, Any] = {}
+
+    @property
+    def cookies(self) -> Any:
+        return self._session.cookies
+
+    @cookies.setter
+    def cookies(self, value: Any) -> None:
+        self._session.cookies = value
+
+    async def request(self, method: str, url: str, **kwargs: Any) -> Any:
+        # httpx uses follow_redirects; curl_cffi uses allow_redirects
+        if "follow_redirects" in kwargs:
+            kwargs["allow_redirects"] = kwargs.pop("follow_redirects")
+        return await self._session.request(method, url, **kwargs)
+
+    @asynccontextmanager  # type: ignore[misc]
+    async def stream(self, method: str, url: str, **kwargs: Any) -> Any:
+        if "follow_redirects" in kwargs:
+            kwargs["allow_redirects"] = kwargs.pop("follow_redirects")
+        async with self._session.stream(method, url, **kwargs) as response:
+            yield response
+
+    async def aclose(self) -> None:
+        await self._session.close()
 
 
 def _log(msg: str) -> None:
@@ -127,9 +168,8 @@ def _restore_transaction_cache(client: Client) -> bool:
 
 
 async def _seed_transaction_cache(client: Client) -> bool:
-    """Fetch x.com homepage with a clean httpx client and seed transaction state."""
+    """Fetch x.com homepage with curl_cffi (Chrome TLS) and seed transaction state."""
     import bs4
-    import httpx
     from twikit.x_client_transaction.transaction import (
         INDICES_REGEX,
         ON_DEMAND_FILE_REGEX,
@@ -144,9 +184,11 @@ async def _seed_transaction_cache(client: Client) -> bool:
             "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         ),
     }
+    proxy = _build_proxy_url()
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=15) as session:
-            r = await session.get("https://x.com", headers=headers)
+        from curl_cffi.requests import AsyncSession as CurlSession
+        async with CurlSession(impersonate="chrome120", proxy=proxy) as session:
+            r = await session.get("https://x.com", headers=headers, allow_redirects=True, timeout=15)
             soup = bs4.BeautifulSoup(r.text, "lxml")
 
             meta = soup.select_one("[name='twitter-site-verification']")
@@ -193,11 +235,23 @@ async def authenticate(client: Client) -> None:
 
     if COOKIES_PATH.exists():
         try:
-            client.load_cookies(str(COOKIES_PATH))
+            with open(COOKIES_PATH) as _cf:
+                _raw = json.load(_cf)
+            # Normalise browser-export format (list of {name,value,domain,...})
+            # to twikit's expected {name: value} dict format.
+            if isinstance(_raw, list):
+                _cookies_dict = {c["name"]: c["value"] for c in _raw if "name" in c}
+                client.set_cookies(_cookies_dict)
+                # Re-save in twikit format so future loads are clean
+                client.save_cookies(str(COOKIES_PATH))
+                _log("Converted browser-format cookies to twikit format")
+            else:
+                client.load_cookies(str(COOKIES_PATH))
             if not _restore_transaction_cache(client):
                 await _seed_transaction_cache(client)
             return
-        except Exception:
+        except Exception as _e:
+            _log(f"Cookie load failed: {_e}")
             COOKIES_PATH.unlink(missing_ok=True)
 
     username = os.environ.get("X_USERNAME", "")
@@ -276,9 +330,32 @@ def _tweet_url(screen_name: str, tweet_id: str) -> str:
 _active_client: Client | None = None
 
 
+def _build_proxy_url() -> str | None:
+    """Build a proxy URL from X_PROXY env var (IP:PORT:USER:PASS or IP:PORT)."""
+    raw = os.environ.get("X_PROXY", "").strip()
+    if not raw:
+        return None
+    parts = raw.split(":")
+    if len(parts) == 4:
+        ip, port, user, password = parts
+        return f"http://{user}:{password}@{ip}:{port}"
+    if len(parts) == 2:
+        return f"http://{raw}"
+    _log(f"X_PROXY format unrecognised (expected IP:PORT:USER:PASS): {raw}")
+    return None
+
+
 async def _get_client() -> Client:
     global _active_client
+    proxy = _build_proxy_url()
+    # Build twikit client then swap its HTTP backend to curl_cffi for
+    # Chrome TLS impersonation (bypasses Cloudflare JA3/JA4 fingerprinting)
     client = Client("en-US")
+    client.http = CurlCffiHttpAdapter(proxy=proxy)
+    if proxy:
+        _log(f"Using curl_cffi + proxy: {proxy.split('@')[-1]}")
+    else:
+        _log("Using curl_cffi (Chrome TLS impersonation, no proxy)")
     await authenticate(client)
     _active_client = client
     return client
