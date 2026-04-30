@@ -1,0 +1,144 @@
+{
+  "schema_version": "1.1.0-alpha",
+  "id": "moltbook-growth-v1",
+  "type": "waybread.objective",
+  "title": "Grow phobosintern Moltbook account",
+  "description": "Increase karma, followers, post virality, and comment depth for the phobosintern Moltbook account. Improve automation reliability (verification solver). Improve content strategy based on engagement data.",
+  "owner": {
+    "agent": "phobosintern",
+    "maintainer": "jerryfane"
+  },
+  "status": "active",
+  "created_at": "2026-04-30T14:00:00Z",
+  "updated_at": "2026-04-30T16:15:00Z",
+  "capsule": {
+    "summary": "Grow phobosintern on Moltbook: karma 958→2000, followers 95→200, top post 129→200 upvotes, verification fail rate <5%. One open proposal: P001 fix verification solver.",
+    "key_points": [
+      "Current karma: 958, target: 2000 (+13/day velocity)",
+      "Current followers: 95, target: 200",
+      "Top post upvotes: 129, target: 200",
+      "Verification failure rate: ~20%, target: <5%",
+      "Open proposal: moltbook-growth-P001 (fix verification solver)"
+    ],
+    "next_use": "Load after profile to understand growth targets and constraints before planning engagement sessions."
+  },
+  "token_policy": {
+    "default_view": "capsule",
+    "max_capsule_tokens": 400,
+    "max_context_tokens": 3000,
+    "payload_strategy": "inline"
+  },
+  "metrics": [
+    {
+      "id": "karma",
+      "type": "counter",
+      "description": "Total karma points on phobosintern account",
+      "unit": "points",
+      "source": "moltbook_api.py stats"
+    },
+    {
+      "id": "followers",
+      "type": "gauge",
+      "description": "Number of accounts following phobosintern",
+      "unit": "accounts",
+      "source": "moltbook_api.py stats"
+    },
+    {
+      "id": "top_post_upvotes",
+      "type": "gauge",
+      "description": "Upvote count on highest-performing post",
+      "unit": "upvotes",
+      "source": "moltbook_api.py stats"
+    },
+    {
+      "id": "verification_fail_rate",
+      "type": "ratio",
+      "description": "Fraction of verification challenges that cause comment submission failure",
+      "unit": "ratio",
+      "source": "observed from moltbook_api.py comment calls"
+    }
+  ],
+  "success_criteria": [
+    {
+      "id": "sc-karma",
+      "metric": "karma",
+      "direction": "increase",
+      "target": 2000,
+      "priority": "primary"
+    },
+    {
+      "id": "sc-followers",
+      "metric": "followers",
+      "direction": "increase",
+      "target": 200,
+      "priority": "secondary"
+    },
+    {
+      "id": "sc-top-post",
+      "metric": "top_post_upvotes",
+      "direction": "increase",
+      "target": 200,
+      "priority": "secondary"
+    },
+    {
+      "id": "sc-verification",
+      "metric": "verification_fail_rate",
+      "direction": "decrease",
+      "target": 0.05,
+      "priority": "primary"
+    }
+  ],
+  "allowed_actions": [
+    {
+      "id": "aa-post",
+      "kind": "domain",
+      "adapter": "moltbook:post",
+      "description": "Post original content"
+    },
+    {
+      "id": "aa-comment",
+      "kind": "domain",
+      "adapter": "moltbook:comment",
+      "description": "Reply to comments and notifications"
+    },
+    {
+      "id": "aa-upvote",
+      "kind": "domain",
+      "adapter": "moltbook:upvote",
+      "description": "Upvote posts"
+    },
+    {
+      "id": "aa-follow",
+      "kind": "domain",
+      "adapter": "moltbook:follow",
+      "description": "Follow accounts"
+    },
+    {
+      "id": "aa-feed",
+      "kind": "domain",
+      "adapter": "moltbook:feed",
+      "description": "Fetch feed and notifications"
+    },
+    {
+      "id": "aa-proposal",
+      "kind": "proposal",
+      "adapter": "waybread:write",
+      "description": "Emit proposals for code changes or strategy changes",
+      "requires_review": true
+    }
+  ],
+  "autonomy": {
+    "domain_actions": "auto_merge",
+    "code_changes": "propose",
+    "prompt_changes": "propose"
+  },
+  "profile_ref": {
+    "uri": "waybread-runs/phobosintern/profile.json",
+    "description": "phobosintern agent profile"
+  },
+  "storage": {
+    "trace_retention": 10,
+    "lesson_retention": 20,
+    "artifact_base": "waybread-runs/phobosintern/moltbook-growth"
+  }
+}

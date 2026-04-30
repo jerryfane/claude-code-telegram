@@ -1,0 +1,112 @@
+{
+  "schema_version": "1.1.0-alpha",
+  "id": "moltbook-growth-P001",
+  "type": "waybread.proposal",
+  "source": "phobosintern — observed verification challenge failures during comment sessions 2026-04-30",
+  "objective_id": "moltbook-growth-v1",
+  "created_at": "2026-04-30T14:00:00Z",
+  "updated_at": "2026-04-30T16:15:00Z",
+  "status": "open",
+  "kind": "code_change",
+  "title": "Fix verification solver bugs in scripts/moltbook_api.py",
+  "summary": "Four bugs in the Moltbook verification solver cause unnecessary comment failures: (A) fuzzy 'for'→'four' false positive; (B) embedded '/' treated as division; (C) 3-char obfuscated number prefixes not merged (e.g. 'ThI rTy' → 'thirty'); (D) bare-number challenges (no arithmetic operator) return None instead of the number.",
+  "rationale": "Each bug causes the solver to return None on a solvable challenge, forcing a comment resubmission and slowing engagement. The verification fail rate is ~20%; fixing these four cases should bring it below 5%.",
+  "expected_impact": {
+    "metrics": ["verification_fail_rate"],
+    "direction": "decrease",
+    "confidence": "high"
+  },
+  "autonomy_required": "test",
+  "risk": {
+    "level": "low",
+    "notes": "Changes are additive. Regressions are caught by the test suite. Rollback: git restore scripts/moltbook_api.py tests/unit/test_verification_solver.py."
+  },
+  "execution": {
+    "mode": "approval_required",
+    "executor": "code_agent",
+    "capability_requirements": [
+      "code:edit",
+      "code:test",
+      "git:read"
+    ],
+    "rollback": "git restore scripts/moltbook_api.py tests/unit/test_verification_solver.py — changes not yet committed",
+    "acceptance_checks": [
+      {
+        "id": "ac-unit-tests",
+        "kind": "test",
+        "description": "poetry run pytest tests/unit/test_verification_solver.py — all 25 tests pass",
+        "evidence_required": true
+      },
+      {
+        "id": "ac-full-suite",
+        "kind": "test",
+        "description": "poetry run pytest tests/ — full suite passes with no regressions",
+        "evidence_required": true
+      },
+      {
+        "id": "ac-bug-a",
+        "kind": "manual_check",
+        "description": "_fuzzy_match_number_word('for') returns None (no false positive)",
+        "evidence_required": false
+      },
+      {
+        "id": "ac-bug-b",
+        "kind": "manual_check",
+        "description": "normalize_text('tH/eE water') contains no standalone '/' token",
+        "evidence_required": false
+      },
+      {
+        "id": "ac-bug-c",
+        "kind": "manual_check",
+        "description": "normalize_text('ThI rTy') returns 'thirty'",
+        "evidence_required": false
+      },
+      {
+        "id": "ac-bug-d",
+        "kind": "test",
+        "description": "solve_verification('ThI rTy-TwO') returns '32.00' (bare-number fallback)",
+        "evidence_required": true
+      }
+    ],
+    "evidence_requirements": [
+      {
+        "id": "ev-test-output",
+        "description": "pytest output showing 25/25 pass in test_verification_solver.py",
+        "must_be_retested": true
+      },
+      {
+        "id": "ev-git-diff",
+        "description": "git diff showing only targeted additive changes to solver and test file"
+      }
+    ]
+  },
+  "acceptance_criteria": [
+    "All 25 tests in tests/unit/test_verification_solver.py pass",
+    "Full test suite passes with no regressions",
+    "solve_verification('ThI rTy-TwO') returns '32.00'",
+    "Jerry reviews diff and approves commit"
+  ],
+  "implementation_hint": {
+    "target": "scripts/moltbook_api.py",
+    "suggested_task": "Fixes already implemented in working tree — pending Jerry diff review and commit approval"
+  },
+  "capsule": {
+    "summary": "Fix 4 solver bugs: fuzzy false-positive, embedded slash, 3-char fragment merge, bare-number fallback. 25/25 tests pass. Awaiting Jerry diff review before commit.",
+    "key_points": [
+      "Bug A: fuzzy 'for'→'four' blocked by length guard (len<4 → None)",
+      "Bug B: embedded '/' in word stripped before operator-preservation step",
+      "Bug C: ('thi','rty') and similar 3-char pairs added to NUMBER_FRAGMENTS",
+      "Bug D: solve_verification() now falls back to _parse_number_word when no operator found",
+      "25 tests pass (was 24); test_solver_bare_hyphenated_number is the new regression test",
+      "Changes are unstaged — commit requires Jerry approval"
+    ],
+    "next_use": "Load when resuming this proposal to check commit status or re-run tests."
+  },
+  "token_policy": {
+    "default_view": "capsule",
+    "max_capsule_tokens": 300,
+    "max_context_tokens": 2000,
+    "payload_strategy": "inline"
+  },
+  "evidence": []
+}

@@ -1,0 +1,145 @@
+{
+  "schema_version": "1.1.0-alpha",
+  "id": "x-growth-v1",
+  "type": "waybread.objective",
+  "title": "Grow @PhobosIntern X/Twitter account",
+  "description": "Increase reply engagement, followers, and organic reach for @PhobosIntern. Fix Error 226 rate-limit reliability. Improve content strategy for genuine audience growth.",
+  "owner": {
+    "agent": "phobosintern",
+    "maintainer": "jerryfane"
+  },
+  "status": "active",
+  "created_at": "2026-04-30T14:00:00Z",
+  "updated_at": "2026-04-30T16:15:00Z",
+  "capsule": {
+    "summary": "Grow @PhobosIntern on X: avg likes 0.05→2.0, avg replies 0.05→1.0, Error 226 incidents frequent→rare. One open proposal: P001 rate-limit backoff.",
+    "key_points": [
+      "Avg likes/tweet: 0.05, target: 2.0",
+      "Avg replies/tweet: 0.05, target: 1.0",
+      "Error 226 rate-limit incidents: frequent, target: rare",
+      "Posting reliability: intermittent, target: 95%",
+      "Open proposal: x-growth-P001 (Error 226 cooldown tracking)"
+    ],
+    "next_use": "Load after profile to understand X growth targets and constraints before planning posting sessions."
+  },
+  "token_policy": {
+    "default_view": "capsule",
+    "max_capsule_tokens": 400,
+    "max_context_tokens": 3000,
+    "payload_strategy": "inline"
+  },
+  "metrics": [
+    {
+      "id": "avg_likes_per_tweet",
+      "type": "gauge",
+      "description": "Average likes per tweet over trailing 30 days",
+      "unit": "likes",
+      "source": "x_post.py timeline"
+    },
+    {
+      "id": "avg_replies_per_tweet",
+      "type": "gauge",
+      "description": "Average replies per tweet over trailing 30 days",
+      "unit": "replies",
+      "source": "x_post.py timeline"
+    },
+    {
+      "id": "rate_limit_incidents",
+      "type": "counter",
+      "description": "Number of Error 226 (automated behavior detected) incidents per cycle",
+      "unit": "incidents",
+      "source": "x_post.py error output"
+    },
+    {
+      "id": "posting_reliability",
+      "type": "ratio",
+      "description": "Fraction of posting attempts that succeed without rate-limit block",
+      "unit": "ratio",
+      "source": "observed from x_post.py calls"
+    }
+  ],
+  "success_criteria": [
+    {
+      "id": "sc-likes",
+      "metric": "avg_likes_per_tweet",
+      "direction": "increase",
+      "target": 2.0,
+      "priority": "primary"
+    },
+    {
+      "id": "sc-replies",
+      "metric": "avg_replies_per_tweet",
+      "direction": "increase",
+      "target": 1.0,
+      "priority": "secondary"
+    },
+    {
+      "id": "sc-rate-limit",
+      "metric": "rate_limit_incidents",
+      "direction": "decrease",
+      "target": 0,
+      "window": "per_cycle",
+      "priority": "primary"
+    },
+    {
+      "id": "sc-reliability",
+      "metric": "posting_reliability",
+      "direction": "increase",
+      "target": 0.95,
+      "priority": "secondary"
+    }
+  ],
+  "allowed_actions": [
+    {
+      "id": "aa-tweet",
+      "kind": "domain",
+      "adapter": "x:tweet",
+      "description": "Post original tweets"
+    },
+    {
+      "id": "aa-reply",
+      "kind": "domain",
+      "adapter": "x:reply",
+      "description": "Reply to tweets"
+    },
+    {
+      "id": "aa-like",
+      "kind": "domain",
+      "adapter": "x:like",
+      "description": "Like posts"
+    },
+    {
+      "id": "aa-follow",
+      "kind": "domain",
+      "adapter": "x:follow",
+      "description": "Follow and unfollow accounts"
+    },
+    {
+      "id": "aa-read",
+      "kind": "domain",
+      "adapter": "x:read",
+      "description": "Read feed, mentions, timeline, diagnose errors"
+    },
+    {
+      "id": "aa-proposal",
+      "kind": "proposal",
+      "adapter": "waybread:write",
+      "description": "Emit proposals for code changes or strategy changes",
+      "requires_review": true
+    }
+  ],
+  "autonomy": {
+    "domain_actions": "auto_merge",
+    "code_changes": "propose",
+    "prompt_changes": "propose"
+  },
+  "profile_ref": {
+    "uri": "waybread-runs/phobosintern/profile.json",
+    "description": "phobosintern agent profile"
+  },
+  "storage": {
+    "trace_retention": 10,
+    "lesson_retention": 20,
+    "artifact_base": "waybread-runs/phobosintern/x-growth"
+  }
+}

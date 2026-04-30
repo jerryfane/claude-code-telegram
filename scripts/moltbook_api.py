@@ -176,6 +176,12 @@ _NUMBER_FRAGMENTS = {
     ("seven", "ty"): "seventy",
     ("eigh", "ty"): "eighty",
     ("nine", "ty"): "ninety",
+    # Bug C fix: 3-char split entries for obfuscated tens prefixes
+    # "ThI rTy" -> "thi" + "rty" after normalization
+    ("thi", "rty"): "thirty",
+    ("eig", "hty"): "eighty",
+    ("nin", "ety"): "ninety",
+    ("twe", "nty"): "twenty",
 }
 
 # Non-number prefixes/suffixes that can get glued to number words (bug #4)
@@ -231,6 +237,21 @@ def _fuzzy_match_number_word(word: str, require_first_char: bool = True) -> Opti
     If require_first_char=True, only match targets whose first char matches the word's first char.
     This prevents phantom matches like 'terr' -> 'zero'.
     """
+    # Bug A fix: minimum length guard — short words produce too many false positives
+    if len(word) < 4:
+        return None
+
+    # Bug A fix: blocklist of common short English words that must never match number words
+    _FUZZY_BLOCKLIST = {
+        "for", "far", "the", "but", "can", "not", "her", "has", "his", "are",
+        "was", "its", "all", "get", "got", "too", "him", "how", "new", "now",
+        "our", "out", "own", "put", "say", "see", "set", "use", "via", "yet",
+        "did", "due", "end", "few", "had", "let", "man", "may", "nor", "off",
+        "old", "ran", "run", "sat", "sir", "sit", "ten", "try", "won", "yes",
+    }
+    if word in _FUZZY_BLOCKLIST:
+        return None
+
     if word in _ALL_NUMBER_WORDS:
         return word
     if word in _TEEN_MISSPELLINGS:
@@ -333,6 +354,11 @@ def _merge_number_fragments(text: str) -> str:
     return " ".join(result)
 
 
+def normalize_text(text: str) -> str:
+    """Public alias for _normalize — exposed for testing."""
+    return _normalize(text)
+
+
 def _normalize(text: str) -> str:
     """Normalize mangled challenge text before any parsing.
 
@@ -341,6 +367,10 @@ def _normalize(text: str) -> str:
 
     "tW/eN tY" -> "twenty", "lOo.bS tTeRr" -> "lobster", "T hR Ee" -> "three"
     """
+    # Bug B fix: strip '/' that is embedded in or adjacent to non-space characters
+    # before operator-preservation runs, so "tH/eE" -> "tH eE" but " / " is preserved.
+    text = re.sub(r"(?<=\S)/|/(?=\S)", " ", text)
+
     # Preserve literal math operators when used as operators (surrounded by
     # spaces/digits), not when embedded in words (tW/eN = slash inside word)
     cleaned = re.sub(r"(?<=\d)\s*\+\s*(?=\d)", " plus ", text)
@@ -352,6 +382,9 @@ def _normalize(text: str) -> str:
     cleaned = re.sub(r"\s-\s", " minus ", cleaned)
     cleaned = re.sub(r"\s\*\s", " times ", cleaned)
     cleaned = re.sub(r"\s/\s", " divided ", cleaned)
+    # Treat hyphens between letters as word separators (e.g. "tHi-rTy" -> "tHi rTy").
+    # Must run BEFORE the all-non-alnum strip so "rTy-TwO" doesn't glue into "rtytwo".
+    cleaned = re.sub(r"(?<=[A-Za-z])-(?=[A-Za-z])", " ", cleaned)
     # Keep only letters, digits, and spaces
     cleaned = re.sub(r"[^a-zA-Z0-9 ]", "", cleaned)
     # Collapse multiple spaces and lowercase
@@ -717,6 +750,11 @@ def solve_verification(challenge_text: str) -> Optional[str]:
 
     operator = _detect_operator(cleaned)
     if not operator:
+        # Bare-number challenge: the entire text IS the answer (e.g. "ThI rTy-TwO" → 32).
+        bare = _parse_number_word(cleaned)
+        if bare is not None:
+            _log(f"No operator — returning bare number: {bare}")
+            return f"{bare:.2f}"
         _log(f"Could not detect operator in: {cleaned}")
         return None
 

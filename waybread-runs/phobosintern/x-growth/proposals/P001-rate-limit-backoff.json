@@ -1,0 +1,111 @@
+{
+  "schema_version": "1.1.0-alpha",
+  "id": "x-growth-P001",
+  "type": "waybread.proposal",
+  "source": "phobosintern — observed Error 226 rate-limit blocking X posting session 2026-04-30T13:02:00Z",
+  "objective_id": "x-growth-v1",
+  "created_at": "2026-04-30T14:00:00Z",
+  "updated_at": "2026-04-30T16:15:00Z",
+  "status": "open",
+  "kind": "code_change",
+  "title": "Add Error 226 cooldown tracking and ETA to scripts/x_post.py",
+  "summary": "When X returns Error 226 (automated behavior detected), x_post.py currently exits with a message and writes no state. The operator must manually track when the cooldown expires. This proposal adds a cooldown file (data/x_rate_limit.json) that records the expiry, so subsequent calls exit immediately with a human-readable ETA instead of attempting the action and failing again.",
+  "rationale": "Without cooldown state, every call during a cooldown window hits X again, burns retries, and degrades posting reliability. A lightweight JSON file (no credentials, only timestamps) solves this with zero new dependencies.",
+  "expected_impact": {
+    "metrics": ["rate_limit_incidents", "posting_reliability"],
+    "direction": "decrease",
+    "confidence": "medium"
+  },
+  "autonomy_required": "propose",
+  "risk": {
+    "level": "low",
+    "notes": "Additive change. Cooldown file contains no credentials — only error_code, reason, created_at, until, action_type. File is runtime-generated and must be gitignored. Rollback: git restore scripts/x_post.py; delete data/x_rate_limit.json."
+  },
+  "execution": {
+    "mode": "approval_required",
+    "executor": "code_agent",
+    "capability_requirements": [
+      "code:edit",
+      "code:test",
+      "git:read"
+    ],
+    "rollback": "git restore scripts/x_post.py — data/x_rate_limit.json is runtime-generated and not tracked",
+    "acceptance_checks": [
+      {
+        "id": "ac-cooldown-write",
+        "kind": "manual_check",
+        "description": "Simulated Error 226 → data/x_rate_limit.json written with expires_at = now+45min",
+        "evidence_required": true
+      },
+      {
+        "id": "ac-cooldown-eta",
+        "kind": "manual_check",
+        "description": "Call during cooldown window → exits with 'Rate limited until HH:MM UTC. Try again then.'",
+        "evidence_required": true
+      },
+      {
+        "id": "ac-cooldown-expiry",
+        "kind": "manual_check",
+        "description": "Call after expiry → cooldown file deleted, action proceeds normally",
+        "evidence_required": false
+      },
+      {
+        "id": "ac-no-credentials",
+        "kind": "artifact_validation",
+        "description": "Cooldown file contains ONLY: error_code, reason, created_at, until, action_type — no cookies, tokens, or credentials",
+        "evidence_required": true
+      },
+      {
+        "id": "ac-gitignore",
+        "kind": "manual_check",
+        "description": ".gitignore covers data/x_rate_limit.json or data/*.json",
+        "evidence_required": false
+      }
+    ],
+    "evidence_requirements": [
+      {
+        "id": "ev-cooldown-file",
+        "description": "Sample cooldown file contents showing correct structure (no credentials)",
+        "must_be_retested": true
+      },
+      {
+        "id": "ev-eta-message",
+        "description": "Terminal output showing ETA message on subsequent call during cooldown"
+      },
+      {
+        "id": "ev-git-diff",
+        "description": "git diff showing minimal additive change to x_post.py"
+      }
+    ]
+  },
+  "acceptance_criteria": [
+    "Error 226 writes data/x_rate_limit.json with expires_at timestamp",
+    "Subsequent calls during cooldown exit with human-readable ETA message",
+    "Call after expiry deletes cooldown file and proceeds",
+    "Cooldown file contains no credentials or tokens",
+    "data/x_rate_limit.json is gitignored",
+    "Jerry reviews diff and approves commit"
+  ],
+  "implementation_hint": {
+    "target": "scripts/x_post.py",
+    "suggested_task": "Add COOLDOWN_PATH constant, _check_cooldown() function, and write cooldown JSON in Error 226 handler. Call _check_cooldown() at start of tweet/reply/like/follow handlers. COOLDOWN_MINUTES env var (default 45)."
+  },
+  "capsule": {
+    "summary": "Open proposal: add Error 226 cooldown tracking to x_post.py. No implementation yet — awaiting Moltbook P001 commit first, then Jerry approval to spawn code agent.",
+    "key_points": [
+      "Error 226 handler writes data/x_rate_limit.json (no credentials, timestamps only)",
+      "Subsequent calls read file and exit with ETA if active, delete if expired",
+      "COOLDOWN_MINUTES env var (default 45) makes duration configurable",
+      "Status: open — not started. Blocked on Moltbook P001 commit review.",
+      "Do NOT spawn code agent until Jerry explicitly approves this proposal"
+    ],
+    "next_use": "Load when resuming X growth work to check if Moltbook P001 is committed and Jerry has approved this proposal."
+  },
+  "token_policy": {
+    "default_view": "capsule",
+    "max_capsule_tokens": 300,
+    "max_context_tokens": 2000,
+    "payload_strategy": "inline"
+  },
+  "evidence": []
+}

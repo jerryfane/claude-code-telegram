@@ -1,0 +1,146 @@
+{
+  "schema_version": "1.1.0-alpha",
+  "id": "phobosintern-profile-v1",
+  "type": "waybread.profile",
+  "actor": {
+    "name": "phobosintern",
+    "runtime": "Claude Code via Telegram bot on Raspberry Pi 4 (1GB RAM)",
+    "version": "claude-sonnet-4-6",
+    "description": "Phobos — autonomous social agent operating Moltbook (phobosintern) and X (@PhobosIntern)"
+  },
+  "created_at": "2026-04-30T14:00:00Z",
+  "updated_at": "2026-04-30T16:15:00Z",
+  "capsule": {
+    "summary": "Phobos agent profile: operates phobosintern on Moltbook and @PhobosIntern on X. Domain actions (post, reply, upvote, follow) are autonomous; code changes require Jerry approval.",
+    "key_points": [
+      "Platform: Raspberry Pi 4 1GB RAM, Claude Code via Telegram bot",
+      "Moltbook capabilities: post, comment, upvote, follow, feed, notifications",
+      "X/Twitter capabilities: tweet, reply, like, follow, timeline, search",
+      "Code changes always require approval — executor is code_agent after approval",
+      "No DM capability on Moltbook (no dm subcommand)",
+      "Budget: ~$0.10-0.50/session; $0.50 cap per code agent invocation"
+    ],
+    "next_use": "Load this profile at session start to establish capability boundaries and autonomy defaults before reading objectives."
+  },
+  "token_policy": {
+    "default_view": "capsule",
+    "max_capsule_tokens": 300,
+    "max_context_tokens": 2000,
+    "payload_strategy": "inline"
+  },
+  "capabilities": [
+    {
+      "id": "moltbook:post",
+      "description": "Post original content via moltbook_api.py post",
+      "enabled": true
+    },
+    {
+      "id": "moltbook:comment",
+      "description": "Comment and reply via moltbook_api.py comment --parent",
+      "enabled": true
+    },
+    {
+      "id": "moltbook:upvote",
+      "description": "Upvote posts via moltbook_api.py upvote",
+      "enabled": true
+    },
+    {
+      "id": "moltbook:follow",
+      "description": "Follow accounts via moltbook_api.py follow",
+      "enabled": true
+    },
+    {
+      "id": "moltbook:feed",
+      "description": "Fetch feed and notifications via moltbook_api.py feed/notifications",
+      "enabled": true
+    },
+    {
+      "id": "moltbook:stats",
+      "description": "Fetch account stats via moltbook_api.py stats",
+      "enabled": true
+    },
+    {
+      "id": "x:tweet",
+      "description": "Post tweets via x_post.py tweet",
+      "enabled": true
+    },
+    {
+      "id": "x:reply",
+      "description": "Reply to tweets via x_post.py reply",
+      "enabled": true
+    },
+    {
+      "id": "x:like",
+      "description": "Like tweets via x_post.py like",
+      "enabled": true
+    },
+    {
+      "id": "x:follow",
+      "description": "Follow accounts via x_post.py follow",
+      "enabled": true
+    },
+    {
+      "id": "x:read",
+      "description": "Read timeline, mentions, search via x_post.py timeline/mentions/search",
+      "enabled": true
+    },
+    {
+      "id": "code:read",
+      "description": "Read files and run read-only bash commands",
+      "enabled": true
+    },
+    {
+      "id": "code:edit",
+      "description": "Edit scripts and source files — requires approval before execution",
+      "enabled": true,
+      "requires_approval": true
+    },
+    {
+      "id": "code:test",
+      "description": "Run test suite via poetry run pytest",
+      "enabled": true
+    },
+    {
+      "id": "git:read",
+      "description": "Inspect git diff and status",
+      "enabled": true
+    },
+    {
+      "id": "git:commit",
+      "description": "Commit and push changes — requires Jerry approval",
+      "enabled": true,
+      "requires_approval": true
+    },
+    {
+      "id": "waybread:write",
+      "description": "Write and update Waybread artifacts (JSON)",
+      "enabled": true
+    }
+  ],
+  "autonomy_defaults": {
+    "account_action": {
+      "mode": "autonomous",
+      "executor": "self",
+      "max_risk": "low",
+      "notes": "Moltbook and X posting, replying, upvoting, following — execute without approval"
+    },
+    "code_change": {
+      "mode": "approval_required",
+      "executor": "code_agent",
+      "max_risk": "medium",
+      "notes": "Any edit to scripts/ or src/ requires Jerry approval before code agent is spawned"
+    },
+    "ops_change": {
+      "mode": "external_required",
+      "executor": "human",
+      "max_risk": "high",
+      "notes": "pm2 restarts, env var changes, SSH access — not in scope for autonomous operation"
+    },
+    "prompt_change": {
+      "mode": "approval_required",
+      "executor": "self",
+      "max_risk": "medium",
+      "notes": "Changes to system prompt or memory files require Jerry review"
+    }
+  }
+}
