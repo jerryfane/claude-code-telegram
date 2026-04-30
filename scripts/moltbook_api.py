@@ -367,10 +367,6 @@ def _normalize(text: str) -> str:
 
     "tW/eN tY" -> "twenty", "lOo.bS tTeRr" -> "lobster", "T hR Ee" -> "three"
     """
-    # Bug B fix: strip '/' that is embedded in or adjacent to non-space characters
-    # before operator-preservation runs, so "tH/eE" -> "tH eE" but " / " is preserved.
-    text = re.sub(r"(?<=\S)/|/(?=\S)", " ", text)
-
     # Preserve literal math operators when used as operators (surrounded by
     # spaces/digits), not when embedded in words (tW/eN = slash inside word)
     cleaned = re.sub(r"(?<=\d)\s*\+\s*(?=\d)", " plus ", text)
@@ -382,6 +378,10 @@ def _normalize(text: str) -> str:
     cleaned = re.sub(r"\s-\s", " minus ", cleaned)
     cleaned = re.sub(r"\s\*\s", " times ", cleaned)
     cleaned = re.sub(r"\s/\s", " divided ", cleaned)
+    # Bug B fix: strip leftover '/' that is embedded in or adjacent to words.
+    # This must run after operator preservation so compact numeric division
+    # ("20/5") is converted to "divided" before noisy slashes are removed.
+    cleaned = re.sub(r"(?<=\S)/|/(?=\S)", " ", cleaned)
     # Treat hyphens between letters as word separators (e.g. "tHi-rTy" -> "tHi rTy").
     # Must run BEFORE the all-non-alnum strip so "rTy-TwO" doesn't glue into "rtytwo".
     cleaned = re.sub(r"(?<=[A-Za-z])-(?=[A-Za-z])", " ", cleaned)

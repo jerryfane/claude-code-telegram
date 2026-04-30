@@ -151,6 +151,9 @@ config/mcp.json
 # Temporary image uploads from Claude processing
 .claude_upload_*
 
+# Local Claude Code agent worktrees/runtime output
+.claude/worktrees/
+
 # Personal assistant memory (private, not shared)
 .memory/
 

@@ -100,6 +100,18 @@ def test_normalize_isolated_slash_preserved_as_division() -> None:
     assert "divided" in result, f"Expected 'divided' in: {result!r}"
 
 
+def test_normalize_compact_numeric_slash_preserved_as_division() -> None:
+    """'20/5' must preserve the slash as division before slash-noise cleanup."""
+    result = normalize_text("20/5")
+    assert result == "20 divided 5"
+
+
+def test_solver_compact_numeric_division() -> None:
+    """Compact numeric division challenges must solve correctly."""
+    answer = solve_verification("20/5")
+    assert answer == "4.00", f"Expected 4.00 but got {answer!r}"
+
+
 def test_normalize_embedded_slash_no_division_operator() -> None:
     """Full sentence with embedded slash must not produce division."""
     text = "speed is twenty three cms and tH/eE water adds six"
